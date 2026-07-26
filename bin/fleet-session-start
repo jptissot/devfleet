@@ -13,6 +13,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/fleet-decision"
 # shellcheck source=bin/fleet-session-lib
 . "$SCRIPT_DIR/fleet-session-lib"
+# shellcheck source=bin/fleet-watch-lib
+. "$SCRIPT_DIR/fleet-watch-lib"
 
 # Resolve mode before fleet_roots: fleet_roots mkdirs $FLEET_STATE, and doing
 # that inside a worktree is exactly the pollution this guard exists to prevent.
@@ -27,6 +29,16 @@ case "$SESSION_MODE" in
 esac
 
 fleet_roots
+
+# The commit-msg hook under .githooks is committed, but inert until this clone
+# points at it, and core.hooksPath is per-clone rather than per-file. This runs at
+# the fleet root in every session, which makes it the one place the pointer is
+# guaranteed to get set. The execute and orphan branches returned above, and
+# correctly: a mission worktree shares its parent clone's config, so the setting
+# is already in force there.
+if [ -n "$(fleet_session_hooks_install "$FLEET_ROOT")" ]; then
+  fleet_journal hooks-path "$FLEET_ROOT .githooks"
+fi
 
 if [ ! -f "$FLEET_CONFIG/roles.json" ]; then
   fleet_config_bootstrap || fleet_die "no roles.json and bootstrap failed"
@@ -74,9 +86,19 @@ done
 date +%s > "$FLEET_STATE/.watch-beacon"
 fleet_journal session-start "reconciled=$reconciled drifted=$drifted"
 
+# Rearm, do not re-add. Every session used to fire a watcher and leave the losers
+# to notice the lock and exit — which held only as long as the lock did. When two
+# survived, both advanced the same mission and both spawned its next stage, and
+# the mission ended up with several agents doing identical work in one worktree.
+# Asking who holds the lock first makes the common case a no-op instead of a race.
 if [ "$NO_WATCH" -eq 0 ]; then
-  "$SCRIPT_DIR/fleet-watch" >/dev/null 2>&1 &
-  fleet_journal watch-spawn "pid=$!"
+  watch_holder="$(fleet_watch_holder || true)"
+  if [ -n "$watch_holder" ]; then
+    fleet_journal watch-alive "pid=$watch_holder"
+  else
+    "$SCRIPT_DIR/fleet-watch" >/dev/null 2>&1 &
+    fleet_journal watch-spawn "pid=$!"
+  fi
 fi
 
 open_decisions="$(fleet_decision_list --open | grep -c . || true)"

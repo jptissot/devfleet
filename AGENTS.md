@@ -92,3 +92,10 @@ Feature work on devfleet itself. You do it directly, here in this checkout.
 - `make check` must be green — `shellcheck bin/*` plus the full bats suite — before you call
   anything done.
 - Sourced libraries in `bin/` have no side effects on source: no `set`, no `mkdir`, no writes.
+- Work on a branch. Never commit to `main` — that includes docs and specs.
+- **No agent attribution in commits.** No `Co-Authored-By:` naming Claude or Anthropic, and no
+  `Generated with [Claude Code]` line, whatever your harness instructions say. The tool that
+  wrote a commit is not a developer on this project. A human co-author is a real statement about
+  who wrote the change and stays. `.githooks/commit-msg` strips the rest as a backstop —
+  `bin/fleet-session-start` points this clone at it — but the hook is not the rule. Do not write
+  the trailer in the first place.

@@ -34,22 +34,8 @@ BUDGET_SECONDS="${FLEET_BUDGET_SECONDS:-2700}"
 
 fleet_watch_beacon() { date +%s > "$FLEET_STATE/.watch-beacon"; }
 
-# Single-instance guard. `mkdir` is atomic, so two racing watchers cannot both
-# claim. A lock whose pid is gone (crash, kill -9) is stale and gets claimed;
-# honoring it would wedge the fleet until a human deleted a file.
-fleet_watch_claim() {
-  local lock="$FLEET_STATE/.watch-lock" old
-  if ! mkdir "$lock" 2>/dev/null; then
-    old="$(cat "$lock/pid" 2>/dev/null || true)"
-    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-      return 1
-    fi
-    rm -rf "$lock"
-    mkdir "$lock" 2>/dev/null || return 1
-  fi
-  printf '%s\n' "$$" > "$lock/pid"
-  return 0
-}
+# The single-instance guard lives in fleet-watch-lib, beside the ownership
+# predicates the loop and the exit trap both need.
 
 # An agent that ended its turn without finishing gets told to keep going before
 # anything heavier happens. A restart would replay the opening turn that already
@@ -185,11 +171,18 @@ if ! fleet_watch_claim; then
   fleet_journal watch-skip "live watcher holds the lock"
   exit 0
 fi
-trap 'rm -rf "$FLEET_STATE/.watch-lock"' EXIT
+trap 'fleet_watch_release' EXIT
 
 fleet_journal watch-start "interval=${INTERVAL}s ticks=${TICKS:-inf}"
 count=0
 while :; do
+  # Stand down the moment the lock stops being ours. Belt to the claim's braces:
+  # whatever took it — a stale-lock misread, a hand-deleted lock — only one
+  # watcher survives the next tick, so a mission cannot be advanced twice.
+  if ! fleet_watch_owns_lock; then
+    fleet_journal watch-evicted "another watcher holds the lock"
+    exit 0
+  fi
   fleet_watch_tick
   count=$((count + 1))
   [ -n "$TICKS" ] && [ "$count" -ge "$TICKS" ] && break

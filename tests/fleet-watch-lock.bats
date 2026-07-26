@@ -48,3 +48,52 @@ teardown() { fleet_teardown_home; }
   run "$REPO_ROOT/bin/fleet-watch" --tick
   [ "$status" -eq 0 ]
 }
+
+# --- single-instance hardening -----------------------------------------------
+
+@test "a claim publishes its pid with the lock, never an empty lock" {
+  . "$REPO_ROOT/bin/fleet-watch-lib"
+  FLEET_STATE="$FLEET_STATE_OVERRIDE" fleet_watch_claim
+  [ -d "$FLEET_STATE_OVERRIDE/.watch-lock" ]
+  [ "$(cat "$FLEET_STATE_OVERRIDE/.watch-lock/pid")" = "$$" ]
+}
+
+@test "a second claim loses while the first holder is alive" {
+  . "$REPO_ROOT/bin/fleet-watch-lib"
+  mkdir -p "$FLEET_STATE_OVERRIDE/.watch-lock"
+  echo $$ > "$FLEET_STATE_OVERRIDE/.watch-lock/pid"
+  run env FLEET_STATE="$FLEET_STATE_OVERRIDE" bash -c \
+    '. "$REPO_ROOT/bin/fleet-watch-lib"; fleet_watch_claim'
+  [ "$status" -ne 0 ]
+  [ "$(cat "$FLEET_STATE_OVERRIDE/.watch-lock/pid")" = "$$" ]
+}
+
+@test "release leaves a lock this process does not own" {
+  . "$REPO_ROOT/bin/fleet-watch-lib"
+  mkdir -p "$FLEET_STATE_OVERRIDE/.watch-lock"
+  echo $$ > "$FLEET_STATE_OVERRIDE/.watch-lock/pid"
+  FLEET_STATE="$FLEET_STATE_OVERRIDE" bash -c \
+    '. "$REPO_ROOT/bin/fleet-watch-lib"; fleet_watch_release'
+  [ -d "$FLEET_STATE_OVERRIDE/.watch-lock" ]
+}
+
+@test "a watcher whose lock was taken evicts itself and leaves the new lock alone" {
+  "$REPO_ROOT/bin/fleet-watch" --ticks 20 --interval 1 >/dev/null 2>&1 &
+  watcher=$!
+  # Wait for it to claim, then simulate a thief taking the lock.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$FLEET_STATE_OVERRIDE/.watch-lock/pid" ] && break
+    sleep 0.2
+  done
+  echo $$ > "$FLEET_STATE_OVERRIDE/.watch-lock/pid"
+  # It notices on its next tick and stands down.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$watcher" 2>/dev/null || break
+    sleep 0.5
+  done
+  ! kill -0 "$watcher" 2>/dev/null
+  grep -q "watch-evicted" "$FLEET_STATE_OVERRIDE/journal.log"
+  # The thief's lock survives the evicted watcher's exit.
+  [ -d "$FLEET_STATE_OVERRIDE/.watch-lock" ]
+  [ "$(cat "$FLEET_STATE_OVERRIDE/.watch-lock/pid")" = "$$" ]
+}

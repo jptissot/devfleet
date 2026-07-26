@@ -85,3 +85,49 @@ fleet_watch_human_draft() {  # <tail-text> -> rc 0 when the input line has conte
 fleet_watch_over_budget() {  # <stage_started_epoch> <now_epoch> <budget_seconds>
   [ "$(( $2 - $1 ))" -ge "$3" ]
 }
+# --- single-instance lock -----------------------------------------------------
+# One watcher per fleet. Two watchers advance the same mission and spawn the same
+# stage twice, which is how one mission ends up with several agents doing
+# identical work in one worktree.
+
+# Published by rename, never by mkdir-then-write. rename(2) refuses to replace a
+# non-empty directory, so the lock only ever becomes visible with its pid already
+# inside — a racing claimant cannot observe a lock mid-creation and mistake the
+# missing pid for an abandoned one. (An *empty* lock directory is replaceable,
+# which is what makes a pre-format or hand-made empty lock claimable.)
+fleet_watch_claim() {  # -> 0 when this process now holds the lock
+  local lock="$FLEET_STATE/.watch-lock" staging="$FLEET_STATE/.watch-lock.$$" old
+  rm -rf "$staging"
+  mkdir "$staging" 2>/dev/null || return 1
+  printf '%s\n' "$$" > "$staging/pid"
+  if mv -T "$staging" "$lock" 2>/dev/null; then return 0; fi
+  old="$(cat "$lock/pid" 2>/dev/null || true)"
+  if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    rm -rf "$staging"; return 1
+  fi
+  # Stale: the holder is gone (crash, kill -9). Honoring it would wedge the fleet
+  # until a human deleted a file.
+  rm -rf "$lock"
+  mv -T "$staging" "$lock" 2>/dev/null && return 0
+  rm -rf "$staging"; return 1
+}
+
+fleet_watch_owns_lock() {  # -> 0 while this process is still the holder
+  [ "$(cat "$FLEET_STATE/.watch-lock/pid" 2>/dev/null || true)" = "$$" ]
+}
+
+# Only the owner releases. A watcher that lost the lock to another must not
+# delete the lock the new holder is running under — that is what lets a third
+# watcher claim freely and puts two of them on the same fleet.
+fleet_watch_release() {
+  fleet_watch_owns_lock && rm -rf "$FLEET_STATE/.watch-lock"
+  return 0
+}
+
+fleet_watch_holder() {  # -> prints the live holder pid, rc 1 when there is none
+  local pid
+  pid="$(cat "$FLEET_STATE/.watch-lock/pid" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  printf '%s' "$pid"
+}

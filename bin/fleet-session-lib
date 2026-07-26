@@ -58,6 +58,26 @@ fleet_session_mode() {
   printf 'root\n'; return 0
 }
 
+# Point this clone at the committed .githooks directory, so the commit-msg hook
+# that strips agent attribution is live. Prints 'set' when it changed something.
+#
+# core.hooksPath is per-clone, not per-file, which is why a committed hook needs
+# this at all. It lands in the shared common config, so every worktree of the
+# clone is covered by the one write.
+#
+# A value the user chose is left alone: overwriting a deliberate setting is worse
+# than a missing backstop. Never fails the caller — a session has to start even
+# where the git config is unwritable.
+fleet_session_hooks_install() {  # <repo-dir>
+  local dir=$1 cur
+  [ -d "$dir/.githooks" ] || return 0
+  git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  cur="$(git -C "$dir" config --local --get core.hooksPath 2>/dev/null || true)"
+  [ -n "$cur" ] && return 0
+  git -C "$dir" config --local core.hooksPath .githooks >/dev/null 2>&1 || return 0
+  printf 'set\n'
+}
+
 # <brief-path> -> the executor briefing. The filename carries the identity:
 # .devfleet/<mission>.<stage>.brief (fleet-spawn:86).
 fleet_session_brief_execute() {

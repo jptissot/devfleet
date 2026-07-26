@@ -1,0 +1,48 @@
+#!/bin/sh
+# commit-msg - strip agent attribution from the commit message.
+#
+# This repo never records a coding agent as a co-developer: the tool that wrote a
+# commit is not a developer on the project, and the trailer is a claim about
+# authorship. A human co-author is left alone.
+#
+# Enable it in a fresh clone with:  git config core.hooksPath .githooks
+# bin/fleet-session-start does that automatically at the fleet root.
+#
+# It deletes rather than rejects. A hook that rejected the commit would stall an
+# agent whose own harness instructions tell it to add the trailer: it re-adds the
+# trailer on the retry, and the commit never lands.
+#
+# sh, not bash: this also runs inside a bunker container, whose image is not
+# guaranteed to carry bash at /bin/bash.
+
+msg=$1
+[ -n "$msg" ] && [ -f "$msg" ] || exit 0
+
+tmp="$msg.devfleet.$$"
+
+awk '
+  {
+    low = tolower($0)
+    # Anchored at the start of the line. A trailer commented out in the git
+    # message template begins with "#", and commenting one out is exactly how a
+    # user opts it back out; that must survive.
+    if (low ~ /^co-authored-by:/) {
+      if (low ~ /anthropic/) next
+      # A bare "Claude <addr>", or Claude followed by a model name. Deliberately
+      # narrow: a human called Claude Dupont is a real co-author and stays.
+      if (low ~ /^co-authored-by:[ \t]*claude[ \t]*</) next
+      if (low ~ /^co-authored-by:[ \t]*claude[ \t]+(code|opus|sonnet|haiku|fable)/) next
+    }
+    if (index($0, "Generated with [Claude Code]")) next
+    if (low ~ /generated with .*claude code/) next
+    lines[++n] = $0
+  }
+  END {
+    # Collapse the blank run a deletion leaves at the end of the message.
+    while (n > 0 && lines[n] ~ /^[ \t]*$/) n--
+    for (i = 1; i <= n; i++) print lines[i]
+  }
+' "$msg" > "$tmp" || { rm -f "$tmp"; exit 0; }
+
+mv "$tmp" "$msg"
+exit 0

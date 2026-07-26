@@ -99,3 +99,92 @@ mk() { "$REPO_ROOT/bin/fleet-mission" --type campaign --project a --repo id:r --
   orca_log_has $'terminal\x1fsend\x1f--terminal\x1fterm_001'
   [ ! -s "$FLEET_STATE_OVERRIDE/.wake-pending" ]
 }
+
+# --- core.hooksPath install ---------------------------------------------------
+
+# A bare git repo with the committed hooks directory in place.
+mk_hookrepo() {
+  local r="$FLEET_TMP/hookrepo"
+  git init -q -b main "$r"
+  mkdir -p "$r/.githooks"
+  printf '#!/bin/sh\nexit 0\n' > "$r/.githooks/commit-msg"; chmod +x "$r/.githooks/commit-msg"
+  printf '%s' "$r"
+}
+
+@test "hooks install points a fresh clone at .githooks" {
+  r="$(mk_hookrepo)"
+  . "$REPO_ROOT/bin/fleet-session-lib"
+  fleet_session_hooks_install "$r"
+  [ "$(git -C "$r" config --get core.hooksPath)" = ".githooks" ]
+}
+
+@test "hooks install is idempotent" {
+  r="$(mk_hookrepo)"
+  . "$REPO_ROOT/bin/fleet-session-lib"
+  fleet_session_hooks_install "$r"
+  run fleet_session_hooks_install "$r"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ "$(git -C "$r" config --get core.hooksPath)" = ".githooks" ]
+}
+
+@test "hooks install leaves a path the user chose alone" {
+  r="$(mk_hookrepo)"
+  git -C "$r" config core.hooksPath .my-hooks
+  . "$REPO_ROOT/bin/fleet-session-lib"
+  fleet_session_hooks_install "$r"
+  [ "$(git -C "$r" config --get core.hooksPath)" = ".my-hooks" ]
+}
+
+@test "hooks install does nothing without a .githooks directory" {
+  r="$FLEET_TMP/nohooks"; git init -q -b main "$r"
+  . "$REPO_ROOT/bin/fleet-session-lib"
+  fleet_session_hooks_install "$r"
+  run git -C "$r" config --get core.hooksPath
+  [ "$status" -ne 0 ]
+}
+
+@test "hooks install reports nothing outside a git repo, and does not fail" {
+  d="$FLEET_TMP/notgit"; mkdir -p "$d/.githooks"
+  . "$REPO_ROOT/bin/fleet-session-lib"
+  run fleet_session_hooks_install "$d"
+  [ "$status" -eq 0 ]
+}
+
+@test "session start sets the hooks path at the fleet root" {
+  r="$(mk_hookrepo)"
+  FLEET_ROOT_OVERRIDE="$r" run "$REPO_ROOT/bin/fleet-session-start" --no-watch
+  [ "$status" -eq 0 ]
+  [ "$(git -C "$r" config --get core.hooksPath)" = ".githooks" ]
+}
+
+@test "session start still succeeds when the hooks path cannot be written" {
+  r="$FLEET_TMP/readonly"; git init -q -b main "$r"; mkdir -p "$r/.githooks"
+  chmod a-w "$r/.git/config"
+  FLEET_ROOT_OVERRIDE="$r" run "$REPO_ROOT/bin/fleet-session-start" --no-watch
+  chmod u+w "$r/.git/config"
+  [ "$status" -eq 0 ]
+}
+
+# --- watcher rearm ------------------------------------------------------------
+
+@test "session start does not arm a second watcher when one is live" {
+  mkdir -p "$FLEET_STATE_OVERRIDE/.watch-lock"
+  echo $$ > "$FLEET_STATE_OVERRIDE/.watch-lock/pid"   # $$ is bats: alive
+  run "$REPO_ROOT/bin/fleet-session-start"
+  [ "$status" -eq 0 ]
+  grep -q "watch-alive" "$FLEET_STATE_OVERRIDE/journal.log"
+  ! grep -q "watch-spawn" "$FLEET_STATE_OVERRIDE/journal.log"
+}
+
+@test "session start arms a watcher when the lock is stale" {
+  mkdir -p "$FLEET_STATE_OVERRIDE/.watch-lock"
+  sleep 0 & dead=$!; wait $dead 2>/dev/null || true
+  echo "$dead" > "$FLEET_STATE_OVERRIDE/.watch-lock/pid"
+  run "$REPO_ROOT/bin/fleet-session-start"
+  [ "$status" -eq 0 ]
+  grep -q "watch-spawn" "$FLEET_STATE_OVERRIDE/journal.log"
+  spawned="$(sed -n 's/.*watch-spawn\tpid=//p' "$FLEET_STATE_OVERRIDE/journal.log" | tail -1)"
+  [ -n "$spawned" ]
+  kill "$spawned" 2>/dev/null || true
+}
