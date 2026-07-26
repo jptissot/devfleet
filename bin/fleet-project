@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-project - project partitions + per-repo ship config (spec "State layout",
+# "Ship modes"). Dual-use: sourceable readers (fleet_project_*, fleet_repo_field)
+# and a runnable CRUD entrypoint. Sourced section has no side effects.
+
+fleet_project_dir()  { printf '%s/%s' "$FLEET_PROJECTS" "$1"; }
+fleet_project_json() { printf '%s/%s/project.json' "$FLEET_PROJECTS" "$1"; }
+
+# Print the repo object (JSON) for <project> <selector>; return 1 if absent.
+fleet_project_repo() {  # <project> <selector>
+  local pj; pj="$(fleet_project_json "$1")"; [ -f "$pj" ] || return 1
+  jq -e --arg s "$2" 'first(.repos[] | select(.selector==$s))' "$pj" 2>/dev/null
+}
+
+# Print one field of a repo; "" if project/repo/field is missing or null.
+fleet_repo_field() {  # <project> <selector> <field>
+  local pj; pj="$(fleet_project_json "$1")"; [ -f "$pj" ] || { printf ''; return 0; }
+  jq -r --arg s "$2" --arg k "$3" \
+    '(first(.repos[] | select(.selector==$s)) | .[$k]) // "" | if type=="boolean" then tostring else . end' \
+    "$pj"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -euo pipefail
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=bin/fleet-common
+  . "$SCRIPT_DIR/fleet-common"
+  fleet_roots
+  cmd="${1:-}"; shift || true
+  case "$cmd" in
+    create)
+      name=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --name) name=$2; shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$name" ] || fleet_die "need --name"
+      d="$(fleet_project_dir "$name")"; mkdir -p "$d"
+      pj="$(fleet_project_json "$name")"
+      [ -f "$pj" ] || jq -n --arg n "$name" '{name:$n,repos:[],night_cap:null}' > "$pj"
+      : >> "$d/memory.md"; : >> "$d/log.md"
+      fleet_journal project-create "$name"
+      printf '%s\n' "$name" ;;
+    add-repo)
+      project="" sel="" path="" branch="main" forge="" mode="report-only" unatt=false bunker=false
+      while [ $# -gt 0 ]; do case "$1" in
+        --project) project=$2; shift 2 ;;
+        --repo) sel=$2; shift 2 ;;
+        --path) path=$2; shift 2 ;;
+        --default-branch) branch=$2; shift 2 ;;
+        --forge) forge=$2; shift 2 ;;
+        --ship-mode) mode=$2; shift 2 ;;
+        --unattended) unatt=true; shift ;;
+        --bunker) bunker=true; shift ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$project" ] && [ -n "$sel" ] || fleet_die "need --project --repo"
+      pj="$(fleet_project_json "$project")"; [ -f "$pj" ] || fleet_die "no project $project"
+      tmp="$(mktemp)"
+      jq --arg s "$sel" --arg p "$path" --arg b "$branch" --arg f "$forge" --arg m "$mode" \
+         --argjson u "$unatt" --argjson bk "$bunker" \
+        '.repos = ((.repos // []) | map(select(.selector != $s))
+                   + [{selector:$s,path:$p,default_branch:$b,forge:$f,ship_mode:$m,unattended:$u,bunker:$bk}])' \
+        "$pj" > "$tmp" && mv "$tmp" "$pj"
+      fleet_journal project-add-repo "$project $sel $mode"
+      printf '%s\n' "$sel" ;;
+    show)
+      name="${1:-}"; [ -n "$name" ] || fleet_die "usage: fleet-project show <name> [--json]"
+      pj="$(fleet_project_json "$name")"; [ -f "$pj" ] || fleet_die "no project $name"
+      if [ "${2:-}" = "--json" ]; then cat "$pj"
+      else jq -r '.repos[] | [.selector,.ship_mode,.forge,(.unattended|tostring)] | @tsv' "$pj"; fi ;;
+    *) fleet_die "usage: fleet-project {create|add-repo|show} ..." ;;
+  esac
+fi

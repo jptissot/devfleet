@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-backend
+. "$SCRIPT_DIR/fleet-backend"
+# shellcheck source=bin/fleet-pipeline
+. "$SCRIPT_DIR/fleet-pipeline"
+# shellcheck source=bin/fleet-config
+. "$SCRIPT_DIR/fleet-config"
+# shellcheck source=bin/fleet-decision
+. "$SCRIPT_DIR/fleet-decision"
+# shellcheck source=bin/fleet-session-lib
+. "$SCRIPT_DIR/fleet-session-lib"
+
+# Resolve mode before fleet_roots: fleet_roots mkdirs $FLEET_STATE, and doing
+# that inside a worktree is exactly the pollution this guard exists to prevent.
+SESSION_MODE="$(fleet_session_mode || true)"
+case "$SESSION_MODE" in
+  execute)
+    fleet_session_brief_execute "$(fleet_session_brief_file)"
+    exit 0 ;;
+  orphan)
+    echo "error: linked worktree with no .devfleet brief — not a fleet root" >&2
+    exit 3 ;;
+esac
+
+fleet_roots
+
+if [ ! -f "$FLEET_CONFIG/roles.json" ]; then
+  fleet_config_bootstrap || fleet_die "no roles.json and bootstrap failed"
+fi
+config_errs="$(fleet_config_validate_all || true)"
+if [ -n "$config_errs" ]; then
+  printf 'config problems found (fleet-config validate for detail):\n%s\n' "$config_errs" >&2
+  fleet_journal config-invalid "$(printf '%s' "$config_errs" | wc -l | tr -d ' ') problems"
+fi
+fleet_config_ceiling_record
+
+NO_WATCH=0
+[ "${1:-}" = "--no-watch" ] && NO_WATCH=1
+
+# Make the Commander reachable. Everything that wakes it — decisions, parks,
+# anomalies — sends to this handle, and with nothing registered those messages
+# were appended to .wake-pending and never read by anyone. A session outside an
+# orca pane leaves an existing registration alone rather than clearing it.
+self_term="$(fleet_backend_terminal_self)"
+if [ -n "$self_term" ]; then
+  printf '%s\n' "$self_term" > "$FLEET_STATE/.commander-terminal"
+  # Deliver what queued while nobody was listening, oldest first.
+  if [ -s "$FLEET_STATE/.wake-pending" ]; then
+    while IFS= read -r pending; do
+      [ -n "$pending" ] || continue
+      fleet_backend_terminal_send "$self_term" "$pending" || true
+    done < "$FLEET_STATE/.wake-pending"
+    : > "$FLEET_STATE/.wake-pending"
+  fi
+fi
+
+reconciled=0 drifted=0
+for mj in "$FLEET_STATE"/missions/*/mission.json; do
+  [ -e "$mj" ] || continue
+  id="$(fleet_json_get "$mj" '.id')"; stage="$(fleet_json_get "$mj" '.stage')"
+  fleet_mission_in_flight "$id" || continue
+  reconciled=$((reconciled + 1))
+  term="$(fleet_json_get "$mj" '.terminal')"
+  if [ "$term" != null ] && [ -n "$term" ] && ! fleet_backend_terminal_exists "$term"; then
+    fleet_journal session-drift "$id $stage terminal-gone"
+    drifted=$((drifted + 1))
+  fi
+done
+
+date +%s > "$FLEET_STATE/.watch-beacon"
+fleet_journal session-start "reconciled=$reconciled drifted=$drifted"
+
+if [ "$NO_WATCH" -eq 0 ]; then
+  "$SCRIPT_DIR/fleet-watch" >/dev/null 2>&1 &
+  fleet_journal watch-spawn "pid=$!"
+fi
+
+open_decisions="$(fleet_decision_list --open | grep -c . || true)"
+fleet_session_brief_root "$reconciled" "$open_decisions" \
+  "$(printf 'reconciled %d missions, %d drifted' "$reconciled" "$drifted")"

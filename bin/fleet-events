@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-events - append-only per-mission event log for commander-driven missions
+# (spec "Drive mode"). Records are the source of truth; wakes are only nudges.
+# The read cursor lives in mission.json, mirroring marker_cursor, so a replayed
+# watcher tick emits nothing twice. Sourced only; no side effects on source.
+
+fleet_events_file() {  # <id>
+  printf '%s/events' "$(fleet_mission_dir "$1")"
+}
+
+fleet_events_append() {  # <id> <kind> <detail>
+  local f; f="$(fleet_events_file "$1")"
+  mkdir -p "$(dirname "$f")"
+  jq -nc --arg ts "$(date '+%Y-%m-%dT%H:%M:%S%z')" --arg k "$2" --arg d "${3:-}" \
+    '{ts:$ts,kind:$k,detail:$d}' >> "$f"
+}
+
+fleet_events_count() {  # <id> -> total events ever appended
+  local f; f="$(fleet_events_file "$1")"
+  if [ -f "$f" ]; then wc -l < "$f" | tr -d ' '; else printf '0'; fi
+}
+
+fleet_events_unread() {  # <id> -> JSONL past .event_cursor
+  local f cur; f="$(fleet_events_file "$1")"
+  [ -f "$f" ] || return 0
+  cur="$(fleet_json_get "$(fleet_mission_json "$1")" '.event_cursor // 0')"
+  tail -n "+$((cur + 1))" "$f"
+}
+
+fleet_events_ack() {  # <id> [count]  (default: everything appended so far)
+  local n=${2:-}
+  [ -n "$n" ] || n="$(fleet_events_count "$1")"
+  fleet_json_set "$(fleet_mission_json "$1")" ".event_cursor=$n"
+}

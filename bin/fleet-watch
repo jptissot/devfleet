@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-backend
+. "$SCRIPT_DIR/fleet-backend"
+# shellcheck source=bin/fleet-pipeline
+. "$SCRIPT_DIR/fleet-pipeline"
+# shellcheck source=bin/fleet-done
+. "$SCRIPT_DIR/fleet-done"
+# shellcheck source=bin/fleet-watch-lib
+. "$SCRIPT_DIR/fleet-watch-lib"
+# shellcheck source=bin/fleet-project
+. "$SCRIPT_DIR/fleet-project"
+# shellcheck source=bin/fleet-bunker
+. "$SCRIPT_DIR/fleet-bunker"
+# shellcheck source=bin/fleet-hooks
+. "$SCRIPT_DIR/fleet-hooks"
+# shellcheck source=bin/fleet-detect
+. "$SCRIPT_DIR/fleet-detect"
+# shellcheck source=bin/fleet-decision
+. "$SCRIPT_DIR/fleet-decision"
+# shellcheck source=bin/fleet-events
+. "$SCRIPT_DIR/fleet-events"
+# shellcheck source=bin/fleet-drive
+. "$SCRIPT_DIR/fleet-drive"
+# shellcheck source=bin/fleet-config
+. "$SCRIPT_DIR/fleet-config"
+fleet_roots
+
+STALL_SECONDS="${FLEET_STALL_SECONDS:-900}"
+BUDGET_SECONDS="${FLEET_BUDGET_SECONDS:-2700}"
+
+fleet_watch_beacon() { date +%s > "$FLEET_STATE/.watch-beacon"; }
+
+# Single-instance guard. `mkdir` is atomic, so two racing watchers cannot both
+# claim. A lock whose pid is gone (crash, kill -9) is stale and gets claimed;
+# honoring it would wedge the fleet until a human deleted a file.
+fleet_watch_claim() {
+  local lock="$FLEET_STATE/.watch-lock" old
+  if ! mkdir "$lock" 2>/dev/null; then
+    old="$(cat "$lock/pid" 2>/dev/null || true)"
+    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+      return 1
+    fi
+    rm -rf "$lock"
+    mkdir "$lock" 2>/dev/null || return 1
+  fi
+  printf '%s\n' "$$" > "$lock/pid"
+  return 0
+}
+
+# An agent that ended its turn without finishing gets told to keep going before
+# anything heavier happens. A restart would replay the opening turn that already
+# ended in prose and throw away the context built since; a nudge costs one line.
+# Two unanswered nudges mean nudging is not the answer, and it falls through to
+# the restart ladder.
+fleet_watch_nudge() {  # <id> <mj> <stage> <reason> -> rc 1 when it is out of nudges
+  local id=$1 mj=$2 stage=$3 reason=$4 n term now text
+  n="$(fleet_json_get "$mj" '.nudges // 0')"
+  [ "$n" -lt "${FLEET_NUDGE_LIMIT:-2}" ] || return 1
+  term="$(fleet_json_get "$mj" '.terminal')"
+  { [ "$term" != null ] && [ -n "$term" ]; } || return 1
+  now="$(date +%s)"
+  # An idle agent has stopped and needs starting; a looping one is busy doing the
+  # wrong thing and needs breaking out of it. Same ladder, different sentence.
+  case "$reason" in
+    loop) text="Stop. You are repeating steps you have already taken. Re-read your brief and the plan, state what is actually left, and do the next unfinished thing — do not redo completed work." ;;
+    *)    text="Continue the $stage stage. Use your tools — do not answer with prose alone. When the work is done, write the completion marker named in your brief." ;;
+  esac
+  fleet_backend_terminal_send "$term" "$text" || return 1
+  # The clock restarts: the nudge is the change, and the agent deserves the same
+  # window to answer it that any other work gets.
+  fleet_json_set "$mj" ".nudges=$((n + 1)) | .last_progress_at=$now"
+  fleet_journal watch-nudge "$id $stage (nudge $((n + 1)))"
+  return 0
+}
+
+# An agent inside a bunker outlives the pane that launched it: closing the
+# terminal detaches a pty, it does not reach a process the sandbox owns.
+fleet_watch_kill_bunkered() {  # <id> <mj>
+  local mj=$2 project repo repo_path wt
+  project="$(fleet_json_get "$mj" '.project')"; repo="$(fleet_json_get "$mj" '.repo')"
+  repo_path="$(fleet_repo_field "$project" "$repo" path)"
+  wt="$(fleet_json_get "$mj" '.worktree_path')"
+  { [ -n "$repo_path" ] && [ -n "$wt" ]; } || return 1
+  fleet_bunker_kill_worktree "$repo_path" "$wt" && fleet_journal bunker-killed "$1 ($wt)"
+}
+
+# Restart-once-then-park on any anomaly (spec "Loop/stall monitoring" action).
+fleet_watch_anomaly() {  # <id> <mj> <stage> <reason>
+  local id=$1 mj=$2 stage=$3 reason=$4 restarts
+  restarts="$(fleet_json_get "$mj" '.restarts')"
+  if [ "$restarts" -lt 1 ]; then
+    # The old agent dies before the new one is born, or nothing is spawned at
+    # all. Two agents in one worktree overwrite each other, and the pair is
+    # indistinguishable from progress to everything downstream.
+    local old_term; old_term="$(fleet_json_get "$mj" '.terminal')"
+    if [ "$old_term" != null ] && [ -n "$old_term" ] \
+       && ! fleet_backend_terminal_stop "$old_term" \
+       && ! { fleet_watch_kill_bunkered "$id" "$mj" && fleet_backend_terminal_stop "$old_term"; }; then
+      fleet_json_set_str "$mj" '.last_stage' "$stage"
+      fleet_json_set_str "$mj" '.stage' "parked"
+      fleet_journal watch-restart-blocked "$id $stage ($reason; $old_term would not stop)"
+      fleet_escalate "$id" "$stage" "$reason" \
+        "mission $id parked at $stage ($reason; its agent would not stop)" >/dev/null
+      return 0
+    fi
+    local now; now="$(date +%s)"
+    fleet_json_set "$mj" ".restarts=1 | .stage_started_at=$now | .last_progress_at=$now | .state_hash=\"\""
+    : > "$(fleet_mission_dir "$id")/hashes"
+    fleet_journal watch-restart "$id $stage ($reason)"
+    "$SCRIPT_DIR/fleet-spawn" --mission "$id" --stage "$stage" >/dev/null
+  else
+    fleet_json_set_str "$mj" '.last_stage' "$stage"
+    fleet_json_set_str "$mj" '.stage' "parked"
+    fleet_journal watch-park "$id $stage ($reason after restart)"
+    fleet_escalate "$id" "$stage" "$reason" "mission $id parked at $stage ($reason after restart)" >/dev/null
+  fi
+}
+
+fleet_watch_check() {  # <id>
+  local id=$1 mj stage count cursor now reason
+  mj="$(fleet_mission_json "$id")"
+  if [ "$(fleet_json_get "$mj" '.driver // "machine"')" = commander ]; then
+    fleet_drive_check "$id"
+    return 0
+  fi
+  fleet_mission_in_flight "$id" || return 0
+  stage="$(fleet_json_get "$mj" '.stage')"
+
+  # Carry anything the agent spooled to orca. Bunkered agents cannot reach the
+  # receiver themselves, and this is what puts them back in the Orca UI.
+  fleet_hooks_relay "$id" || true
+
+  count="$(fleet_done_count "$id")"; cursor="$(fleet_json_get "$mj" '.marker_cursor')"
+  if [ "$count" -gt "$cursor" ]; then
+    "$SCRIPT_DIR/fleet-advance" "$id" >/dev/null
+    return 0
+  fi
+
+  now="$(date +%s)"
+  reason="$(fleet_detect_anomaly "$id" "$now" "$STALL_SECONDS" "$BUDGET_SECONDS")"
+  [ -n "$reason" ] || return 0
+  # Two anomalies have a gentler answer than a restart: an agent that stopped,
+  # and one going in circles. Both are usually fixed by saying so. When the
+  # nudges are spent they become ordinary anomalies and take the restart ladder.
+  case "$reason" in
+    idle | loop)
+      fleet_watch_nudge "$id" "$mj" "$stage" "$reason" && return 0 ;;
+  esac
+  fleet_watch_anomaly "$id" "$mj" "$stage" "$reason"
+  return 0
+}
+
+fleet_watch_tick() {
+  fleet_config_ceiling_check >/dev/null
+  local mj id
+  for mj in "$FLEET_STATE"/missions/*/mission.json; do
+    [ -e "$mj" ] || continue
+    id="$(fleet_json_get "$mj" '.id')"
+    fleet_watch_check "$id" || fleet_journal watch-check-error "$id"
+  done
+  fleet_watch_beacon
+  [ "$(fleet_mode)" = night ] && "$SCRIPT_DIR/fleet-night" pump >/dev/null 2>&1 || true
+}
+
+INTERVAL="${FLEET_WATCH_INTERVAL:-5}"; TICKS=""; ONE_TICK=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tick) ONE_TICK=1; shift ;;
+    --ticks) TICKS=$2; shift 2 ;;
+    --interval) INTERVAL=$2; shift 2 ;;
+    *) fleet_die "usage: fleet-watch [--tick | --ticks <n>] [--interval <s>]" ;;
+  esac
+done
+
+if [ "$ONE_TICK" -eq 1 ]; then
+  fleet_watch_tick
+  exit 0
+fi
+
+if ! fleet_watch_claim; then
+  fleet_journal watch-skip "live watcher holds the lock"
+  exit 0
+fi
+trap 'rm -rf "$FLEET_STATE/.watch-lock"' EXIT
+
+fleet_journal watch-start "interval=${INTERVAL}s ticks=${TICKS:-inf}"
+count=0
+while :; do
+  fleet_watch_tick
+  count=$((count + 1))
+  [ -n "$TICKS" ] && [ "$count" -ge "$TICKS" ] && break
+  [ "$INTERVAL" -gt 0 ] && sleep "$INTERVAL"
+done

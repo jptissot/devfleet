@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-forge - the ONE seam for forge (PR) ops (spec "Ship modes: direct-PR").
+# GitHub via `gh` (swap `gh-axi`), Gitea/Forgejo via `tea` (swap `tea-axi`).
+# Sourced only; no side effects on source. rc 3 == tool unavailable (degrade).
+
+fleet_forge_pr() {  # <forge> <repo_path> <branch> <base> <title> -> prints url; rc 3 if no tool
+  local forge=$1 path=$2 branch=$3 base=$4 title=$5
+  case "$forge" in
+    github)
+      command -v gh >/dev/null 2>&1 || return 3
+      git -C "$path" push -u origin "$branch" >/dev/null 2>&1 || true
+      ( cd "$path" && gh pr create --head "$branch" --base "$base" --title "$title" --body "" ) ;;
+    gitea|forgejo)
+      # Pick the tool BEFORE pushing so the rc-3 degrade stays side-effect free
+      # (matches the github arm, which also checks first).
+      local tool
+      if command -v tea-axi >/dev/null 2>&1; then tool=tea-axi
+      elif command -v tea >/dev/null 2>&1; then tool=tea
+      else return 3
+      fi
+      git -C "$path" push -u origin "$branch" >/dev/null 2>&1 || true
+      local out url
+      out="$( cd "$path" && "$tool" pr create --head "$branch" --base "$base" --title "$title" )" || return 1
+      # tea-axi is an AXI: it renders TOON, so the URL arrives as a field rather
+      # than as the whole of stdout. The encoder quotes a value containing a
+      # colon — every URL — but that is its choice, not a contract, so accept
+      # both. Plain `tea` prints the bare URL and falls through unchanged.
+      url="$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*url:[[:space:]]*//p' | head -1)"
+      url="${url%\"}"; url="${url#\"}"
+      printf '%s\n' "${url:-$out}" ;;
+    *) return 2 ;;
+  esac
+}

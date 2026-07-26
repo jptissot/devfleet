@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-config - the single door for configuration writes and the schema check
+# behind them (spec "bin/fleet-config"). Setup and pipeline definition are things
+# the Commander does, not things the user does by hand. Dual-use: sourceable
+# (fleet_config_*) and runnable. Sourced section has no side effects on source.
+
+fleet_config_prompt_path() {  # <file> -> resolved path or "" if missing
+  local p
+  for p in "$FLEET_HOME/prompts/$1" "$FLEET_ROOT/prompts/$1"; do
+    [ -f "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  printf ''
+}
+
+# Emits "<file>\t<error>" lines on stdout; returns 1 if any were emitted.
+fleet_config_validate_type() {  # <type>
+  local t=$1 f="$FLEET_CONFIG/missions/$1.json" bad=0 driver
+  [ -f "$f" ] || { printf '%s\tno such mission type\n' "$f"; return 1; }
+  jq -e . "$f" >/dev/null 2>&1 || { printf '%s\tmalformed JSON\n' "$f"; return 1; }
+  [ -n "$(jq -r '.type // ""' "$f")" ] || { printf '%s\tmissing .type\n' "$f"; bad=1; }
+
+  # With three types you remember what they are. With ten you do not, and
+  # neither does the Commander, which picks a type from the user's request and
+  # otherwise has only a filename to go on.
+  local desc when
+  desc="$(jq -r '.description // ""' "$f")"
+  when="$(jq -r '.when_to_use // ""' "$f")"
+  [ -n "$desc" ] || { printf '%s\tmissing description\n' "$f"; bad=1; }
+  [ -n "$when" ] || { printf '%s\tmissing when_to_use\n' "$f"; bad=1; }
+
+  driver="$(jq -r '.driver // "machine"' "$f")"
+  case "$driver" in
+    machine|commander) ;;
+    *) printf '%s\tunknown driver "%s"\n' "$f" "$driver"; bad=1 ;;
+  esac
+
+  local names entry
+  if [ "$driver" = commander ]; then
+    names="$(jq -r '.palette[]?.name' "$f")"
+    [ -n "$names" ] || { printf '%s\tcommander type has an empty palette\n' "$f"; bad=1; }
+  else
+    names="$(jq -r '.stages[]?.name' "$f")"
+    [ -n "$names" ] || { printf '%s\tmachine type has no stages\n' "$f"; bad=1; }
+    entry="$(jq -r '.entry // ""' "$f")"
+    if [ -z "$entry" ]; then
+      printf '%s\tmissing .entry\n' "$f"; bad=1
+    elif ! printf '%s\n' "$names" | grep -qx "$entry"; then
+      printf '%s\tentry "%s" is not one of the stages\n' "$f" "$entry"; bad=1
+    fi
+  fi
+
+  local key n role prompt terminal
+  [ "$driver" = commander ] && key=palette || key=stages
+  # Use | as delimiter so empty fields are preserved (IFS tab collapses empties).
+  while IFS='|' read -r n role prompt terminal; do
+    [ -n "$n" ] || continue
+    # Terminal stages (report, ready, etc.) do not spawn an agent.
+    [ "$terminal" = "true" ] && continue
+    if [ -z "$role" ]; then
+      printf '%s\t%s: missing role\n' "$f" "$n"; bad=1
+    elif [ "$(jq -r --arg r "$role" '(.[$r].cmd // "")' "$FLEET_CONFIG/roles.json" 2>/dev/null)" = "" ]; then
+      printf '%s\t%s: unknown role "%s" (not in roles.json)\n' "$f" "$n" "$role"; bad=1
+    fi
+    if [ -z "$prompt" ]; then
+      printf '%s\t%s: missing prompt\n' "$f" "$n"; bad=1
+    elif [ -z "$(fleet_config_prompt_path "$prompt")" ]; then
+      printf '%s\t%s: prompt file "%s" not found\n' "$f" "$n" "$prompt"; bad=1
+    fi
+  done < <(jq -r --arg k "$key" '.[$k][]? | [.name, (.role // ""), (.prompt // ""), (.terminal // "false")] | join("|")' "$f")
+
+  [ "$bad" -eq 0 ]
+}
+
+fleet_config_validate_all() {  # -> "<file>\t<error>" lines; 1 if any
+  local bad=0 f t
+  if [ ! -f "$FLEET_CONFIG/roles.json" ]; then
+    printf '%s\tmissing (run: fleet-config bootstrap)\n' "$FLEET_CONFIG/roles.json"; bad=1
+  elif ! jq -e . "$FLEET_CONFIG/roles.json" >/dev/null 2>&1; then
+    printf '%s\tmalformed JSON\n' "$FLEET_CONFIG/roles.json"; bad=1
+  fi
+  for f in "$FLEET_CONFIG"/missions/*.json; do
+    [ -e "$f" ] || continue
+    t="$(basename "$f" .json)"
+    fleet_config_validate_type "$t" || bad=1
+  done
+  for f in "$FLEET_PROJECTS"/*/project.json; do
+    [ -e "$f" ] || continue
+    jq -e . "$f" >/dev/null 2>&1 || { printf '%s\tmalformed JSON\n' "$f"; bad=1; }
+  done
+  [ "$bad" -eq 0 ]
+}
+
+fleet_config_first_on_path() {  # <candidates...> -> first command that exists, or ""
+  local c
+  for c in "$@"; do command -v "$c" >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }; done
+  printf ''
+}
+
+# shellcheck disable=SC2086  # deliberate word splitting in fleet_config_bootstrap
+fleet_config_bootstrap() {  # [--force] -> writes roles.json, prints the mapping
+  # Harness lists live inside the function: this library is sourced by fleet-spawn
+  # and fleet-watch, and libraries here define functions only — no side effects.
+  local frontier_harnesses="claude codex grok"
+  local executor_harnesses="pi opencode"
+  local force=0 f="$FLEET_CONFIG/roles.json" frontier executor note=""
+  [ "${1:-}" = "--force" ] && force=1
+  if [ -f "$f" ] && [ "$force" -eq 0 ]; then
+    fleet_die "$f already exists (use --force to overwrite)"
+  fi
+  frontier="$(fleet_config_first_on_path $frontier_harnesses)"
+  executor="$(fleet_config_first_on_path $executor_harnesses)"
+  if [ -z "$frontier" ] && [ -z "$executor" ]; then
+    fleet_die "no harness found on PATH (looked for: $frontier_harnesses $executor_harnesses)"
+  fi
+  if [ -z "$frontier" ]; then frontier="$executor"; note=" (fills both roles)"; fi
+  if [ -z "$executor" ]; then executor="$frontier"; note=" (fills both roles)"; fi
+  mkdir -p "$FLEET_CONFIG"
+  jq -n --arg f "$frontier" --arg e "$executor" \
+    '{frontier: {harness: $f, cmd: $f}, executor: {harness: $e, cmd: $e, bunker: true}}' > "$f"
+  fleet_journal config-bootstrap "frontier=$frontier executor=$executor"
+  printf 'roles.json written: frontier=%s executor=%s%s\n' "$frontier" "$executor" "$note"
+}
+
+# Ceilings are the user's, not the Commander's. The clamp is applied where the
+# cap is READ, so hand-editing a mission type cannot route around it.
+fleet_config_ceiling_hash() {  # -> digest of config/fleet.json, or "none"
+  local f="$FLEET_CONFIG/fleet.json"
+  if [ -f "$f" ]; then sha256sum < "$f" | cut -d' ' -f1; else printf 'none'; fi
+}
+
+fleet_config_ceiling_record() {  # store the current digest as the accepted one
+  fleet_config_ceiling_hash > "$FLEET_STATE/.fleet-config-hash"
+}
+
+# Ceilings are the user's. A change the user did not announce is worth one
+# decision record — the file is off-limits to the Commander.
+fleet_config_ceiling_check() {  # -> decision id if drift was found
+  local now stored did vals
+  now="$(fleet_config_ceiling_hash)"
+  stored="$(cat "$FLEET_STATE/.fleet-config-hash" 2>/dev/null || true)"
+  [ -n "$stored" ] || { printf '%s' "$now" > "$FLEET_STATE/.fleet-config-hash"; return 0; }
+  [ "$now" = "$stored" ] && return 0
+  printf '%s' "$now" > "$FLEET_STATE/.fleet-config-hash"   # fire once per change
+  # Name the current values so the record — deduped to one open decision — still
+  # reflects the latest change when several land before the user answers.
+  vals="max_spawns=$(fleet_pipeline_ceiling max_spawns) max_mission_seconds=$(fleet_pipeline_ceiling max_mission_seconds)"
+  fleet_journal ceiling-drift "config/fleet.json changed ($vals)"
+  did="$(fleet_decision_create "fleet" "-" "ceiling" \
+    "ceilings in config/fleet.json changed ($vals) — was that you?" "ceiling drift detected" \
+    '[{"key":"ack","label":"ack","description":"the change was intentional"}]')"
+  [ "$(fleet_mode)" = day ] && "$SCRIPT_DIR/fleet-wake" "decision $did: config/fleet.json changed ($vals)" 2>/dev/null || true
+  printf '%s' "$did"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -euo pipefail
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=bin/fleet-common
+  . "$SCRIPT_DIR/fleet-common"
+  # shellcheck source=bin/fleet-pipeline
+  . "$SCRIPT_DIR/fleet-pipeline"
+  fleet_roots
+
+  cmd="${1:-}"; shift || true
+  case "$cmd" in
+    validate)
+      findings="$(fleet_config_validate_all || true)"
+      if [ "${1:-}" = "--json" ]; then
+        printf '%s' "$findings" | jq -Rsc 'split("\n") | map(select(length > 0))
+          | map(split("\t") | {file: .[0], error: .[1]})'
+      elif [ -z "$findings" ]; then
+        echo "ok: configuration validates"
+      else
+        printf '%s\n' "$findings" | while IFS=$'\t' read -r file err; do
+          echo "error: $file: $err" >&2
+        done
+      fi
+      [ -z "$findings" ] ;;
+    bootstrap) fleet_config_bootstrap "${1:-}" ;;
+    roles)
+      [ "${1:-}" = set ] || fleet_die "usage: fleet-config roles set --role <r> --harness <h> --cmd <c> [--bunker true|false]"
+      shift
+      ROLE="" HARNESS="" RCMD="" BUNKER="" PROV=()
+      while [ $# -gt 0 ]; do case "$1" in
+        --role) ROLE=$2; shift 2 ;;
+        --harness) HARNESS=$2; shift 2 ;;
+        --cmd) RCMD=$2; shift 2 ;;
+        --bunker) BUNKER=$2; shift 2 ;;
+        --provision) PROV+=("$2"); shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$ROLE" ] && [ -n "$HARNESS" ] && [ -n "$RCMD" ] \
+        || fleet_die "need --role --harness --cmd"
+      f="$FLEET_CONFIG/roles.json"
+      [ -f "$f" ] || printf '{}\n' > "$f"
+      tmp="$(mktemp)"
+      # The role is rewritten whole, so an omitted --provision drops a stale list
+      # rather than leaving commands nobody asked for to run at the next provision.
+      prov_json="$(printf '%s\n' ${PROV[@]+"${PROV[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')"
+      jq --arg r "$ROLE" --arg h "$HARNESS" --arg c "$RCMD" --arg b "$BUNKER" --argjson p "$prov_json" \
+        '.[$r] = ({harness: $h, cmd: $c}
+                  + (if $b == "" then {} else {bunker: ($b == "true")} end)
+                  + (if ($p | length) == 0 then {} else {provision: $p} end))' \
+        "$f" > "$tmp" && mv "$tmp" "$f"
+      fleet_journal config-roles-set "$ROLE=$RCMD"
+      echo "roles.json: $ROLE -> $RCMD" ;;
+    project)
+      "$SCRIPT_DIR/fleet-project" "$@" ;;
+    type)
+      sub="${1:-}"; shift || true
+      NAME="" DRIVER="commander" ENTRY="" MAXSP="" MAXSEC="" PAL="[]" STG="[]" DESC="" WHEN=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --name) NAME=$2; shift 2 ;;
+        --driver) DRIVER=$2; shift 2 ;;
+        --entry) ENTRY=$2; shift 2 ;;
+        --description) DESC=$2; shift 2 ;;
+        --when-to-use) WHEN=$2; shift 2 ;;
+        --max-spawns) MAXSP=$2; shift 2 ;;
+        --max-seconds) MAXSEC=$2; shift 2 ;;
+        --palette) IFS=: read -r pn pr pp <<<"$2"
+          PAL="$(printf '%s' "$PAL" | jq --arg n "$pn" --arg r "$pr" --arg p "$pp" \
+                 '. + [{name: $n, role: $r, prompt: $p}]')"; shift 2 ;;
+        --stage) IFS=: read -r sn sr sp sx <<<"$2"
+          STG="$(printf '%s' "$STG" | jq --arg n "$sn" --arg r "$sr" --arg p "$sp" --arg x "$sx" \
+                 '. + [{name: $n, role: $r, prompt: $p, next: $x}]')"; shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$NAME" ] || fleet_die "need --name"
+      f="$FLEET_CONFIG/missions/$NAME.json"
+
+      case "$sub" in
+        show)
+          [ -f "$f" ] || fleet_die "no mission type $NAME"
+          jq . "$f"; exit 0 ;;
+        create|set) ;;
+        *) fleet_die "usage: fleet-config type {create|set|show} --name <t> ..." ;;
+      esac
+
+      # A palette belongs to a commander type, a stage graph to a machine type.
+      # The effective driver is the flag on create, the existing file on set.
+      # Reject the mismatch so a `set --stage` can't strand dead `stages` on a
+      # commander type (validation keys on driver and would silently ignore it).
+      eff_driver="$DRIVER"
+      [ "$sub" = set ] && { [ -f "$f" ] || fleet_die "no mission type $NAME"; \
+        eff_driver="$(jq -r '.driver // "machine"' "$f")"; }
+      [ "$eff_driver" = commander ] && [ "$STG" != "[]" ] \
+        && fleet_die "$NAME is commander-driven — use --palette, not --stage"
+      [ "$eff_driver" = machine ] && [ "$PAL" != "[]" ] \
+        && fleet_die "$NAME is machine-driven — use --stage, not --palette"
+
+      # Caps are clamped at read time; refusing here is the readable error.
+      for pair in "max_spawns:$MAXSP" "max_mission_seconds:$MAXSEC"; do
+        capname="${pair%%:*}"; capval="${pair#*:}"
+        [ -n "$capval" ] || continue
+        ceiling="$(fleet_pipeline_ceiling "$capname")"
+        [ "$capval" -le "$ceiling" ] \
+          || fleet_die "$capname $capval exceeds the fleet ceiling ($ceiling) — lower it or edit config/fleet.json yourself"
+      done
+
+      # description/when_to_use are optional flags here: `set` must leave an
+      # existing value alone when the flag is not passed, and an empty string
+      # merges to nothing either way. Task 4 made both required at validate
+      # time, so a `create` without them writes a file validation will
+      # reject — a loud failure at the single door, not a silent gap.
+      tmp="$(mktemp)"
+      if [ "$sub" = create ]; then
+        [ -f "$f" ] && fleet_die "mission type $NAME already exists (use: fleet-config type set)"
+        jq -n --arg t "$NAME" --arg d "$DRIVER" --arg e "$ENTRY" --arg desc "$DESC" --arg when "$WHEN" \
+              --argjson pal "$PAL" --argjson stg "$STG" \
+          '{type: $t, driver: $d}
+           + (if ($pal | length) > 0 then {palette: $pal} else {} end)
+           + (if ($stg | length) > 0 then {stages: $stg} else {} end)
+           + (if $e == "" then {} else {entry: $e} end)
+           + (if $desc == "" then {} else {description: $desc} end)
+           + (if $when == "" then {} else {when_to_use: $when} end)' > "$tmp"
+      else
+        [ -f "$f" ] || fleet_die "no mission type $NAME"
+        jq --argjson pal "$PAL" --argjson stg "$STG" --arg e "$ENTRY" --arg desc "$DESC" --arg when "$WHEN" \
+          '. + (if ($pal | length) > 0 then {palette: $pal} else {} end)
+             + (if ($stg | length) > 0 then {stages: $stg} else {} end)
+             + (if $e == "" then {} else {entry: $e} end)
+             + (if $desc == "" then {} else {description: $desc} end)
+             + (if $when == "" then {} else {when_to_use: $when} end)' "$f" > "$tmp"
+      fi
+      [ -n "$MAXSP" ]  && { jq --argjson v "$MAXSP"  '.max_spawns=$v'          "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"; }
+      [ -n "$MAXSEC" ] && { jq --argjson v "$MAXSEC" '.max_mission_seconds=$v' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"; }
+
+      # Validate the candidate in place before it becomes the real file.
+      backup=""
+      [ -f "$f" ] && { backup="$(mktemp)"; cp "$f" "$backup"; }
+      cp "$tmp" "$f"
+      if ! errs="$(fleet_config_validate_type "$NAME")"; then
+        if [ -n "$backup" ]; then cp "$backup" "$f"; else rm -f "$f"; fi
+        fleet_die "refused: $errs"
+      fi
+      fleet_journal config-type "$sub $NAME"
+      echo "$f" ;;
+    prompt)
+      sub="${1:-}"; shift || true
+      PNAME="" PTEXT="" PMISSION="" PLABEL=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --name) PNAME=$2; shift 2 ;;
+        --text) PTEXT=$2; shift 2 ;;
+        --mission) PMISSION=$2; shift 2 ;;
+        --label) PLABEL=$2; shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$PNAME" ] || fleet_die "need --name"
+      # PNAME may nest a subdirectory (e.g. "blueprint/interview.txt"); mkdir
+      # its parent, not just the prompts root, or the write below fails.
+      mkdir -p "$(dirname "$FLEET_HOME/prompts/$PNAME")"
+      case "$sub" in
+        write)
+          [ -n "$PTEXT" ] || fleet_die "need --text"
+          printf '%s\n' "$PTEXT" > "$FLEET_HOME/prompts/$PNAME"
+          fleet_journal config-prompt "write $PNAME" ;;
+        promote)
+          [ -n "$PMISSION" ] && [ -n "$PLABEL" ] || fleet_die "need --mission and --label"
+          wt="$(fleet_json_get "$(fleet_mission_json "$PMISSION")" '.worktree_path')"
+          brief="$wt/.devfleet/$PMISSION.$PLABEL.brief"
+          [ -f "$brief" ] || fleet_die "no brief at $brief"
+          # Drop the completion-contract footer fleet-spawn appends on every launch.
+          sed '/^When finished, run: fleet-done /,$d' "$brief" > "$FLEET_HOME/prompts/$PNAME"
+          fleet_journal config-prompt "promote $PMISSION/$PLABEL -> $PNAME" ;;
+        *) fleet_die "usage: fleet-config prompt {write|promote} ..." ;;
+      esac
+      echo "$FLEET_HOME/prompts/$PNAME" ;;
+    *) fleet_die "usage: fleet-config {bootstrap|validate|roles|project|type|prompt} ..." ;;
+  esac
+fi

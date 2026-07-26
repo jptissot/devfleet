@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-decision - durable decision records (spec "Decision inbox"). Dual-use:
+# sourceable (fleet_decision_* + fleet_escalate) and runnable (CRUD entrypoint).
+
+fleet_decision_dir() { printf '%s/decisions' "$FLEET_STATE"; }
+fleet_decision_file() { printf '%s/decisions/%s.json' "$FLEET_STATE" "$1"; }
+
+# Find an existing OPEN record for mission+stage, print its id or nothing.
+fleet_decision_open_for() {  # <mission> <stage>
+  local f
+  for f in "$(fleet_decision_dir)"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.status' "$f")" = open ] || continue
+    [ "$(jq -r '.mission' "$f")" = "$1" ] && [ "$(jq -r '.stage' "$f")" = "$2" ] \
+      && { jq -r '.id' "$f"; return 0; }
+  done
+  return 1
+}
+
+fleet_decision_create() {  # <mission> <project> <stage> <question> <context> [options-json]
+  local mission=$1 project=$2 stage=$3 question=$4 context=${5:-} opts=${6:-[]} did existing now
+  existing="$(fleet_decision_open_for "$mission" "$stage" || true)"
+  [ -n "$existing" ] && { printf '%s' "$existing"; return 0; }
+  did="$(fleet_next_decision_id)"
+  now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  mkdir -p "$(fleet_decision_dir)"
+  jq -n --arg id "$did" --arg m "$mission" --arg p "$project" --arg s "$stage" \
+        --arg q "$question" --arg c "$context" --argjson o "$opts" --arg now "$now" \
+    '{id:$id,mission:$m,project:$p,stage:$s,question:$q,context:$c,options:$o,
+      status:"open",answer:null,created_at:$now,answered_at:null}' \
+    > "$(fleet_decision_file "$did")"
+  printf '%s' "$did"
+}
+
+fleet_decision_list() {  # [--open]
+  local only_open=0; [ "${1:-}" = "--open" ] && only_open=1
+  local f
+  for f in "$(fleet_decision_dir)"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$only_open" -eq 1 ] && [ "$(jq -r '.status' "$f")" != open ] && continue
+    jq -r '[.id,.status,.mission,.question] | @tsv' "$f"
+  done | sort
+}
+
+fleet_decision_footer() {
+  local n; n="$(fleet_decision_list --open | wc -l | tr -d ' ')"
+  [ "$n" -eq 0 ] && return 0
+  printf '⏳ %s pending:' "$n"
+  fleet_decision_list --open | while IFS=$'\t' read -r id _ _ q; do printf ' [%s] %s' "$id" "$q"; done
+  printf '\n'
+}
+
+# fleet_escalate: create a record and, in day mode, wake the Commander. Defined
+# here so fleet-watch/fleet-advance share one escalation path. Needs the caller's
+# $SCRIPT_DIR to reach fleet-wake.
+fleet_escalate() {  # <mission> <stage> <reason> <question>
+  local mission=$1 stage=$2 reason=$3 question=$4 project did
+  project="$(fleet_json_get "$(fleet_mission_json "$mission")" '.project')"
+  did="$(fleet_decision_create "$mission" "$project" "$stage" "$question" "escalated: $reason" \
+        '[{"key":"resume","label":"resume from '"$stage"'","description":"re-run the stage"}]')"
+  fleet_journal decision-open "$did $mission $stage ($reason)"
+  if [ "$(fleet_mode)" = day ]; then
+    "$SCRIPT_DIR/fleet-wake" "decision $did: $question" 2>/dev/null || true
+  fi
+  printf '%s' "$did"
+}
+
+fleet_decision_answer() {  # <did> <answer>
+  local did=$1 answer=$2 f mission now
+  f="$(fleet_decision_file "$did")"; [ -f "$f" ] || { echo "error: no decision $did" >&2; return 1; }
+  now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  jq --arg a "$answer" --arg now "$now" '.status="answered" | .answer=$a | .answered_at=$now' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  mission="$(jq -r '.mission' "$f")"
+  fleet_journal decision-answered "$did $mission $answer"
+  if [ "$answer" = resume ]; then
+    fleet_decision_resume "$mission"
+  elif [ "$answer" = ship ]; then
+    "$SCRIPT_DIR/fleet-ship" "$mission" >/dev/null
+  elif [ "$answer" = extend ]; then
+    fleet_decision_extend "$mission"
+  elif [ "$answer" = init ]; then
+    local mj project repo repo_path
+    mj="$(fleet_mission_json "$mission")"
+    project="$(fleet_json_get "$mj" '.project')"; repo="$(fleet_json_get "$mj" '.repo')"
+    repo_path="$(fleet_repo_field "$project" "$repo" path)"
+    if [ -n "$repo_path" ]; then
+      if "$SCRIPT_DIR/fleet-loadout" init --path "$repo_path" >/dev/null 2>&1; then
+        fleet_journal loadout-scaffold "$mission $repo ($repo_path)"
+        "$SCRIPT_DIR/fleet-wake" "loadout scaffolded for $repo — review .airlock/, run: fleet-loadout build --path $repo_path, then re-spawn $mission" 2>/dev/null || true
+      else
+        fleet_journal loadout-scaffold-fail "$mission $repo ($repo_path)"
+        "$SCRIPT_DIR/fleet-wake" "loadout scaffold FAILED for $repo — run: fleet-loadout init --path $repo_path by hand, then re-spawn $mission" 2>/dev/null || true
+      fi
+    else
+      "$SCRIPT_DIR/fleet-wake" "decision $did: $mission repo $repo has no registered path — register it, then init the loadout" 2>/dev/null || true
+    fi
+  elif [ "$(fleet_mode)" = day ]; then
+    "$SCRIPT_DIR/fleet-wake" "decision $did answered: $answer" 2>/dev/null || true
+  fi
+}
+
+# Lifting a hard cap is the user's call, not the Commander's: grant one fresh
+# allowance of both drive caps and hand the mission back.
+fleet_decision_extend() {  # <mission>
+  local mission=$1 mj now
+  mj="$(fleet_mission_json "$mission")"
+  [ "$(fleet_json_get "$mj" '.driver // "machine"')" = commander ] \
+    || { echo "error: $mission is machine-driven; 'extend' does not apply" >&2; return 1; }
+  now="$(date +%s)"
+  fleet_json_set "$mj" ".spawn_count=0 | .mission_started_at=$now | .extends=(.extends + 1) | .last_anomaly_key=\"\""
+  fleet_json_set_str "$mj" '.stage' "driving"
+  fleet_journal decision-extend "$mission (extend #$(fleet_json_get "$mj" '.extends'))"
+  "$SCRIPT_DIR/fleet-wake" "mission $mission extended — caps reset, it is yours again" 2>/dev/null || true
+}
+
+fleet_decision_resume() {  # <mission>
+  local mission=$1 mj ls now old_term driver
+  mj="$(fleet_mission_json "$mission")"
+  driver="$(fleet_json_get "$mj" '.driver // "machine"')"
+  if [ "$driver" = commander ]; then
+    old_term="$(fleet_json_get "$mj" '.terminal')"
+    [ "$old_term" != null ] && [ -n "$old_term" ] && fleet_backend_terminal_stop "$old_term"
+    fleet_json_set "$mj" '.terminal=null'
+    fleet_json_set_str "$mj" '.stage' "driving"
+    fleet_json_set_str "$mj" '.last_anomaly_key' ""
+    fleet_journal decision-resume "$mission -> driving (commander-driven, no respawn)"
+    "$SCRIPT_DIR/fleet-wake" "mission $mission un-parked — it is yours again" 2>/dev/null || true
+    return 0
+  fi
+  ls="$(fleet_json_get "$mj" '.last_stage')"
+  [ -n "$ls" ] && [ "$ls" != null ] || { echo "error: $mission has no last_stage to resume" >&2; return 1; }
+  old_term="$(fleet_json_get "$mj" '.terminal')"
+  [ "$old_term" != null ] && [ -n "$old_term" ] && fleet_backend_terminal_stop "$old_term"
+  now="$(date +%s)"
+  fleet_json_set_str "$mj" '.stage' "$ls"
+  fleet_json_set "$mj" ".restarts=0 | .stage_started_at=$now | .last_progress_at=$now | .state_hash=\"\""
+  fleet_journal decision-resume "$mission -> $ls (stopped $old_term)"
+  "$SCRIPT_DIR/fleet-spawn" --mission "$mission" --stage "$ls" >/dev/null
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -euo pipefail
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=bin/fleet-common
+  . "$SCRIPT_DIR/fleet-common"
+  # shellcheck source=bin/fleet-backend
+  . "$SCRIPT_DIR/fleet-backend"
+  # shellcheck source=bin/fleet-project
+  . "$SCRIPT_DIR/fleet-project"
+  fleet_roots
+  cmd="${1:-}"; shift || true
+  case "$cmd" in
+    create)
+      mission="" stage="" question="" context="" opts="[]"
+      while [ $# -gt 0 ]; do case "$1" in
+        --mission) mission=$2; shift 2 ;;
+        --stage) stage=$2; shift 2 ;;
+        --question) question=$2; shift 2 ;;
+        --context) context=$2; shift 2 ;;
+        --option) IFS=: read -r k l d <<<"$2"
+          opts="$(printf '%s' "$opts" | jq --arg k "$k" --arg l "$l" --arg d "$d" '. + [{key:$k,label:$l,description:$d}]')"; shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$mission" ] && [ -n "$stage" ] && [ -n "$question" ] || fleet_die "need --mission --stage --question"
+      project="$(fleet_json_get "$(fleet_mission_json "$mission")" '.project')"
+      fleet_decision_create "$mission" "$project" "$stage" "$question" "$context" "$opts"
+      echo ;;
+    list) fleet_decision_list "${1:-}" ;;
+    footer) fleet_decision_footer ;;
+    show)
+      f="$(fleet_decision_file "$1")"; [ -f "$f" ] || fleet_die "no decision $1"
+      if [ "${2:-}" = "--json" ]; then cat "$f"; else jq -r '[.id,.status,.mission,.stage,.question]|@tsv' "$f"; fi ;;
+    answer) [ $# -ge 2 ] || fleet_die "usage: fleet-decision answer <did> <answer>"
+            fleet_decision_answer "$1" "$2" ;;
+    *) fleet_die "usage: fleet-decision {create|list|footer|show|answer} ..." ;;
+  esac
+fi

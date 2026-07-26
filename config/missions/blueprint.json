@@ -1,0 +1,13 @@
+{
+  "type": "blueprint",
+  "description": "interview a human, then write and review a spec",
+  "when_to_use": "the work is not written down yet — research, an investigation, or a feature nobody has specified",
+  "entry": "blueprint",
+  "fix_round_limit": 3,
+  "max_mission_seconds": 21600,
+  "stages": [
+    { "name": "blueprint", "role": "frontier", "prompt": "blueprint/interview.txt", "interactive": true, "next": "review" },
+    { "name": "review",    "role": "frontier", "prompt": "blueprint/review.txt",    "review": true, "on_pass": "ready", "on_fail": "refine" },
+    { "name": "refine",    "role": "frontier", "prompt": "blueprint/refine.txt",    "next": "review" }
+  ]
+}

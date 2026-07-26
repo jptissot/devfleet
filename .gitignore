@@ -1,0 +1,7 @@
+state/
+config/roles.json
+.agent-sandbox/state/
+.superpowers/.worktrees/
+.worktrees/
+config/fleet.json
+projects/

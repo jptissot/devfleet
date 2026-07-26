@@ -1,0 +1,4 @@
+{
+  "max_spawns_ceiling": 24,
+  "max_mission_seconds_ceiling": 28800
+}

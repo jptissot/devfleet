@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-pipeline
+. "$SCRIPT_DIR/fleet-pipeline"
+# shellcheck source=bin/fleet-backend
+. "$SCRIPT_DIR/fleet-backend"
+# shellcheck source=bin/fleet-done
+. "$SCRIPT_DIR/fleet-done"
+# shellcheck source=bin/fleet-decision
+. "$SCRIPT_DIR/fleet-decision"
+# shellcheck source=bin/fleet-project
+. "$SCRIPT_DIR/fleet-project"
+# shellcheck source=bin/fleet-bunker
+. "$SCRIPT_DIR/fleet-bunker"
+fleet_roots
+
+ID="${1:-}"; [ -n "$ID" ] || fleet_die "usage: fleet-advance <mission-id>"
+mj="$(fleet_mission_json "$ID")"; [ -f "$mj" ] || fleet_die "no mission $ID"
+TYPE="$(fleet_json_get "$mj" '.type')"
+[ "$(fleet_json_get "$mj" '.driver // "machine"')" = commander ] \
+  && fleet_die "mission $ID is commander-driven — use fleet-drive"
+STAGE="$(fleet_json_get "$mj" '.stage')"
+FIX="$(fleet_json_get "$mj" '.fix_round')"
+WT="$(fleet_json_get "$mj" '.worktree_path')"
+LIMIT="$(fleet_pipeline_fix_limit "$TYPE")"
+
+COUNT="$(fleet_done_count "$ID")"
+CURSOR="$(fleet_json_get "$mj" '.marker_cursor')"
+if [ "$COUNT" -le "$CURSOR" ]; then
+  printf '%s\n' "$STAGE"     # no new marker -> no-op (idempotent for the watcher)
+  exit 0
+fi
+fleet_json_set_str "$mj" '.last_stage' "$STAGE"   # preserve where we stopped (Finding 5)
+
+verb="$(fleet_done_latest "$ID" || true)"
+now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+set_stage() { fleet_json_set_str "$mj" '.stage' "$1"; fleet_json_set "$mj" ".updated_at=\"$now\""; }
+set_fix()   { fleet_json_set "$mj" ".fix_round=$1 | .updated_at=\"$now\""; }
+log() { printf '%s\t%s\n' "$now" "$*" >> "$(fleet_mission_dir "$ID")/log"; fleet_journal advance "$ID $*"; }
+spawn() {  # <stage>
+  # The finished stage's agent is still running: a marker says the work is done,
+  # not that the process exited. Nothing else stops it, and left alone it keeps
+  # editing the worktree the next stage is about to read.
+  local old; old="$(fleet_json_get "$mj" '.terminal')"
+  if [ "$old" != null ] && [ -n "$old" ] && ! fleet_backend_terminal_stop "$old"; then
+    set_stage parked
+    fleet_journal advance-stop-blocked "$ID $STAGE ($old would not stop)"
+    fleet_escalate "$ID" "$STAGE" "stop-blocked" \
+      "mission $ID parked at $STAGE (the finished agent would not stop)" >/dev/null
+    return 1
+  fi
+  local now_epoch; now_epoch="$(date +%s)"
+  fleet_json_set "$mj" ".restarts=0 | .stage_started_at=$now_epoch | .last_progress_at=$now_epoch | .state_hash=\"\""
+  "$SCRIPT_DIR/fleet-spawn" --mission "$ID" --stage "$1" >/dev/null
+}
+
+# Spend the marker before acting on it. Whatever happens next — a refused spawn,
+# a park — this marker has been read, and replaying it would advance a mission
+# that never moved, or declare a just-spawned agent finished.
+fleet_json_set "$mj" ".marker_cursor=$COUNT"
+
+# A stage that ends without a successor — ready, done, parked, blocked, failed —
+# spawns nothing, so the stop inside spawn() never runs and the finished agent
+# stays in its pane looking like it is still working. Close it and forget the
+# handle: the mission is not in flight any more.
+retire() {
+  local old; old="$(fleet_json_get "$mj" '.terminal')"
+  { [ "$old" != null ] && [ -n "$old" ]; } || return 0
+  fleet_backend_terminal_stop "$old" || {
+    mission_kill_bunkered
+    fleet_backend_terminal_stop "$old" || fleet_journal advance-retire-failed "$ID $STAGE ($old)"
+  }
+  fleet_json_set "$mj" '.terminal=null'
+}
+
+# The agent lives inside the container, and closing its pane does not reach it.
+mission_kill_bunkered() {
+  local project repo repo_path
+  project="$(fleet_json_get "$mj" '.project')"; repo="$(fleet_json_get "$mj" '.repo')"
+  repo_path="$(fleet_repo_field "$project" "$repo" path)"
+  [ -n "$repo_path" ] || return 0
+  fleet_bunker_kill_worktree "$repo_path" "$WT" \
+    && fleet_journal bunker-killed "$ID $STAGE ($WT)"
+}
+
+next_state=""
+case "$verb" in
+  failed:*)  set_stage failed; next_state=failed; log "failed: ${verb#failed:}"; retire ;;
+  blocked:*) set_stage blocked; next_state=blocked; log "blocked: ${verb#blocked:}"
+             fleet_escalate "$ID" "$STAGE" "blocked" "mission $ID blocked at $STAGE: ${verb#blocked:}" >/dev/null
+             retire ;;
+  done)
+    if [ "$(fleet_pipeline_field "$TYPE" "$STAGE" review)" = "true" ]; then
+      # Stop first, then read. findings.json and the marker are two writes with
+      # no ordering between them, and a reviewer still running after its marker
+      # can revise the verdict the pipeline is about to act on — m001 was
+      # ship-approved on a PASS that became FAIL three minutes later. Retiring
+      # the agent makes the verdict final by construction rather than by timing.
+      retire
+      result="$(jq -r '.result // "FAIL"' "$WT/findings.json" 2>/dev/null || echo FAIL)"
+      if [ "$result" = "PASS" ]; then
+        on_pass="$(fleet_pipeline_field "$TYPE" "$STAGE" on_pass)"
+        set_stage "$on_pass"; next_state="$on_pass"; log "review PASS -> $on_pass"
+        unatt="$(fleet_repo_field "$(fleet_json_get "$mj" '.project')" "$(fleet_json_get "$mj" '.repo')" unattended)"
+        if [ "$unatt" = "true" ]; then
+          "$SCRIPT_DIR/fleet-ship" "$ID" >/dev/null; next_state="done"; log "unattended -> shipped"
+        else
+          fleet_decision_create "$ID" "$(fleet_json_get "$mj" '.project')" "$STAGE" \
+            "mission $ID passed review — ship?" "review PASS" \
+            '[{"key":"ship","label":"ship","description":"apply the repo ship mode"},{"key":"hold","label":"hold","description":"leave in ready"}]' >/dev/null
+          [ "$(fleet_mode)" = day ] && "$SCRIPT_DIR/fleet-wake" "mission $ID passed review — ship?" 2>/dev/null || true
+          log "review PASS -> awaiting ship approval"
+        fi
+      elif [ "$FIX" -lt "$LIMIT" ]; then
+        set_fix "$((FIX + 1))"
+        on_fail="$(fleet_pipeline_field "$TYPE" "$STAGE" on_fail)"
+        set_stage "$on_fail"; next_state="$on_fail"; log "review FAIL -> $on_fail (round $((FIX + 1)))"
+        spawn "$on_fail"
+      else
+        set_stage parked; next_state=parked; log "review FAIL, rounds exhausted -> parked"; retire
+        fleet_escalate "$ID" "$STAGE" "fix-rounds-exhausted" "mission $ID parked at $STAGE after $LIMIT fix rounds" >/dev/null
+      fi
+    elif [ "$(fleet_pipeline_field "$TYPE" "$STAGE" terminal)" = "true" ]; then
+      set_stage "done"; next_state="done"; log "terminal stage -> done"; retire
+    else
+      nxt="$(fleet_pipeline_field "$TYPE" "$STAGE" next)"
+      if [ "$nxt" = "ready" ]; then
+        set_stage ready; next_state=ready; log "-> ready"; retire
+      else
+        set_stage "$nxt"; next_state="$nxt"; log "$STAGE done -> $nxt"
+        spawn "$nxt"
+      fi
+    fi
+    ;;
+  *) set_stage parked; next_state=parked; log "unknown marker '$verb' -> parked (fail-closed)"; retire
+     fleet_escalate "$ID" "$STAGE" "unknown-marker" "mission $ID parked at $STAGE (unrecognized completion)" >/dev/null ;;
+esac
+
+printf '%s\n' "$next_state"

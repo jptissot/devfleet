@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-backend
+. "$SCRIPT_DIR/fleet-backend"
+# shellcheck source=bin/fleet-pipeline
+. "$SCRIPT_DIR/fleet-pipeline"
+fleet_roots
+
+TYPE="" PROJECT="" REPO="" DESC="" SPEC="" ISSUE="" ID=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --type) TYPE=$2; shift 2 ;;
+    --project) PROJECT=$2; shift 2 ;;
+    --repo) REPO=$2; shift 2 ;;
+    --desc) DESC=$2; shift 2 ;;
+    --spec) SPEC=$2; shift 2 ;;
+    --issue) ISSUE=$2; shift 2 ;;
+    --id) ID=$2; shift 2 ;;
+    *) fleet_die "unknown flag: $1" ;;
+  esac
+done
+[ -n "$TYPE" ] && [ -n "$PROJECT" ] && [ -n "$REPO" ] && [ -n "$DESC" ] || fleet_die "need --type --project --repo --desc"
+fleet_pipeline_file "$TYPE" >/dev/null   # validates type
+
+[ -n "$ID" ] || ID="$(fleet_next_id)"
+DRIVER="$(fleet_pipeline_driver "$TYPE")"
+if [ "$DRIVER" = commander ]; then
+  STAGE="driving"          # no entry stage: the Commander picks the first step
+else
+  STAGE="$(fleet_pipeline_entry "$TYPE")"
+  # Artifact-skip rule: a provided spec skips the campaign spec stage.
+  if [ "$TYPE" = campaign ] && [ -n "$SPEC" ]; then STAGE="plan"; fi
+fi
+
+fleet_backend_status_ready || fleet_die "orca runtime not ready"
+IFS=$'\t' read -r WT_ID WT_PATH <<<"$(fleet_backend_worktree_create "$REPO" "fleet-$ID")" \
+  || fleet_die "worktree create failed"
+
+mdir="$(fleet_mission_dir "$ID")"; mkdir -p "$mdir"
+now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+jq -n \
+  --arg id "$ID" --arg type "$TYPE" --arg project "$PROJECT" --arg repo "$REPO" \
+  --arg desc "$DESC" --arg stage "$STAGE" --arg wt "$WT_PATH" --arg wtid "$WT_ID" \
+  --arg driver "$DRIVER" \
+  --arg spec "$SPEC" --arg issue "$ISSUE" --arg now "$now" --arg now_epoch "$(date +%s)" \
+  '{id:$id,type:$type,project:$project,repo:$repo,description:$desc,stage:$stage,last_stage:$stage,
+    driver:$driver,fix_round:0,restarts:0,marker_cursor:0,
+    spawn_count:0,event_cursor:0,extends:0,last_anomaly_key:"",
+    mission_started_at:($now_epoch|tonumber),
+    stage_started_at:($now_epoch|tonumber),last_progress_at:($now_epoch|tonumber),state_hash:"",
+    worktree_path:$wt,orca_worktree_id:$wtid,terminal:null,
+    artifacts:({} + (if $spec!="" then {spec:$spec} else {} end)
+                  + (if $issue!="" then {issue:$issue} else {} end)),
+    created_at:$now,updated_at:$now}' \
+  > "$(fleet_mission_json "$ID")"
+
+: > "$mdir/log"
+fleet_journal mission-create "$ID $TYPE $STAGE"
+printf '%s\n' "$ID"

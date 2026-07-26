@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-detect - shared effect-level anomaly detection for both mission drivers.
+# Detection is identical in machine and drive mode; only the response differs
+# (machine restarts once then parks; drive emits an event and wakes). Progress
+# bookkeeping (state_hash, last_progress_at, hashes history) happens here because
+# both lanes need it. Sourced only; no side effects on source.
+
+fleet_detect_anomaly() {  # <id> <now_epoch> <stall_seconds> <budget_seconds> -> reason or ""
+  local id=$1 now=$2 stall=$3 budget=$4 mj term wt
+  mj="$(fleet_mission_json "$id")"
+  term="$(fleet_json_get "$mj" '.terminal')"
+  wt="$(fleet_json_get "$mj" '.worktree_path')"
+
+  local type stage interactive
+  type="$(fleet_json_get "$mj" '.type')"
+  stage="$(fleet_json_get "$mj" '.stage')"
+  # A stage that declares itself interactive is one a human is expected to be
+  # sitting in front of. Silence there is the normal state, so the four verdicts
+  # that mean "nothing is happening" are not evidence of anything. Liveness still
+  # is: a crashed agent must not read as a patient one.
+  interactive="$(fleet_pipeline_field "$type" "$stage" interactive)"
+
+  if [ "$term" != null ] && [ -n "$term" ]; then
+    if ! fleet_backend_terminal_exists "$term"; then
+      printf 'terminal-gone'; return 0
+    fi
+    local state exit_code blocked satisfied agent_state
+    state="$(fleet_backend_terminal_state "$term" 2000 || true)"
+    exit_code="$(printf '%s' "$state" | cut -f3)"
+    blocked="$(printf '%s' "$state" | cut -f2)"
+    satisfied="$(printf '%s' "$state" | cut -f1)"
+    # "working" from the agent's own hooks outranks any screen heuristic below.
+    agent_state="$(fleet_backend_agent_state "$term" | cut -f1)"
+    if [ -n "$exit_code" ] && [ "$exit_code" != null ]; then
+      printf 'exit:%s' "$exit_code"; return 0
+    fi
+    case "$blocked" in
+      *trust*|*permission*|*approval*) printf 'blocked:%s' "$blocked"; return 0 ;;
+    esac
+  fi
+
+  local old new tree screen last started hashes screens
+  old="$(fleet_json_get "$mj" '.state_hash')"
+  # Two hashes, two questions.
+  #
+  # `tree` is the working tree alone, and only it feeds cycle detection: a loop
+  # is A,B,A in the *files*. Mixing the screen into that would hide every loop,
+  # because a screen never returns to a state it has already shown.
+  #
+  # `new` adds the screen, and answers "is this agent doing anything at all" — a
+  # stage can read a dependency's source for twenty minutes before writing a
+  # line, and only the screen separates that from a wedged prompt.
+  tree="$(fleet_watch_hash "$wt")"
+  new="$tree" screen=""
+  if [ "$term" != null ] && [ -n "$term" ]; then
+    screen="$(fleet_backend_terminal_digest "$term")"
+    new="$tree:$screen"
+  fi
+  last="$(fleet_json_get "$mj" '.last_progress_at')"
+  started="$(fleet_json_get "$mj" '.stage_started_at')"
+  hashes="$(fleet_mission_dir "$id")/hashes"
+  screens="$(fleet_mission_dir "$id")/screens"
+  if [ "$new" != "$old" ]; then
+    fleet_json_set "$mj" ".state_hash=\"$new\" | .last_progress_at=$now"
+    if [ "$interactive" != true ] && fleet_watch_cycle "$hashes" "$tree"; then
+      printf 'cycle'; return 0
+    fi
+    # Looping agents *are* moving, so this has to be judged on the progress path
+    # rather than the stall one: same screens coming round again while the files
+    # churn underneath.
+    if [ "$interactive" != true ] && [ -n "$screen" ] \
+       && fleet_watch_screen_loop "$screens" "$screen" \
+            "${FLEET_LOOP_WINDOW:-8}" "${FLEET_LOOP_REPEATS:-3}"; then
+      printf 'loop'; return 0
+    fi
+    # Nothing here retires a nudge. A nudge is typed into the pane, and the agent
+    # answers it with a burst of output, so the tick after one *always* looks
+    # like progress — the tally was cleared by its own consequence and the limit
+    # was unreachable. m002 was nudged three times, each journalled "nudge 1".
+    #
+    # The tally is per stage instead: `fleet-spawn` zeroes it, so a new stage and
+    # a restart each grant a fresh allowance, and within one stage the count only
+    # rises. Progress does not buy more nudges — a stage that works, stops, works
+    # and stops again is the exact pathology the ladder exists to escalate.
+    return 0
+  fi
+  # queued, never started: the pump owns kickoff, not the stall detector
+  { [ "$term" = null ] || [ -z "$term" ]; } && return 0
+  # Idle at its own prompt with nothing to show for it: the turn ended without a
+  # marker, so the agent is waiting for input no one will send. Cheaper to answer
+  # than to restart — it keeps the context the agent has already built.
+  #
+  # Two sources, in order of trust. The agent's own hook report is definitive and
+  # needs no waiting period; the screen heuristic is the fallback for agents that
+  # do not report, and it has to see the silence last before believing it.
+  #
+  # Unless a human is at the keyboard. A pane with a half-typed reply in its
+  # input line is occupied, not idle, and both answers to idleness — type a nudge
+  # into it, or restart the agent underneath it — destroy what the operator was
+  # writing. Neither the hook feed nor `terminal wait` distinguishes "asked a
+  # question" from "gave up", so the draft on screen is the only evidence there
+  # is that someone is still answering.
+  if [ "$interactive" != true ] \
+     && ! fleet_watch_human_draft "$(fleet_backend_terminal_tail "$term")"; then
+    if [ "$agent_state" = "done" ]; then printf 'idle'; return 0; fi
+    if [ -z "$agent_state" ] && [ "$satisfied" = true ] \
+       && [ "$(( now - last ))" -ge "${FLEET_NUDGE_SECONDS:-120}" ]; then
+      printf 'idle'; return 0
+    fi
+    if fleet_watch_stalled "$old" "$new" "$last" "$now" "$stall"; then printf 'stalled'; return 0; fi
+  fi
+  # The budget stays hard: a cap a draft could hold open forever is not a cap.
+  # But an interview runs on a human clock, so an interactive stage substitutes
+  # its own, larger budget here rather than at the call sites — that keeps
+  # fleet-watch and fleet-drive from having to know which stages are interactive.
+  local eff_budget="$budget"
+  if [ "$interactive" = true ]; then
+    eff_budget="$(fleet_pipeline_interactive_budget "$type")"
+  fi
+  if fleet_watch_over_budget "$started" "$now" "$eff_budget"; then printf 'over-budget'; return 0; fi
+  return 0
+}

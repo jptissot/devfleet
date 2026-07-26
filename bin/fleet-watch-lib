@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-watch-lib - pure predicates for effect-level loop/stall detection
+# (spec "Loop/stall monitoring"). No mutation except cycle's history append.
+# Time is always passed in; nothing here reads the clock.
+
+fleet_watch_hash() {  # <worktree> -> stable hash of working-tree state ("no-git" if not a repo)
+  git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { printf 'no-git'; return 0; }
+  { git -C "$1" status --porcelain 2>/dev/null; git -C "$1" diff 2>/dev/null; } \
+    | sha256sum | cut -d' ' -f1
+}
+
+fleet_watch_stalled() {  # <old> <new> <last_progress_epoch> <now_epoch> <stall_seconds>
+  [ "$2" = "$1" ] || return 1
+  [ "$(( $4 - $3 ))" -ge "$5" ]
+}
+
+# How many times a value *returns* inside the recent window. Adjacent duplicates
+# collapse first: a state that simply persists is one visit, not many. Counting
+# raw samples made "the tree stopped changing" indistinguishable from "the tree
+# keeps coming back", and parked a mission whose agent was working steadily.
+fleet_watch_returns() {  # <history-file> <value> <window> -> count on stdout
+  local hist=$1 value=$2 window=$3
+  tail -n "$window" "$hist" | uniq | grep -cxF "$value"
+}
+
+fleet_watch_cycle() {  # <hashes_file> <new_hash> — an oscillation, not one return
+  # A,B,A alone is not evidence. A clean worktree hashes to a constant, so any
+  # transient file — a build artifact, a scratch file the agent removes — lands
+  # back on the same hash and looked exactly like an edit-revert loop. m001 was
+  # restarted and then parked for one such blip while its reviewer was working.
+  #
+  # A real loop repeats: the state has to come round at least twice, inside a
+  # recent window, with something else in between.
+  printf '%s\n' "$2" >> "$1"
+  local window=${FLEET_CYCLE_WINDOW:-6} threshold=${FLEET_CYCLE_REPEATS:-3} recent seen distinct
+  if [ "$(wc -l < "$1")" -gt $(( window * 2 )) ]; then
+    tail -n "$window" "$1" > "$1.trim" && mv "$1.trim" "$1"
+  fi
+  recent="$(tail -n "$window" "$1")"
+  seen="$(fleet_watch_returns "$1" "$2" "$window")"
+  distinct="$(printf '%s\n' "$recent" | sort -u | grep -c .)"
+  [ "$seen" -ge "$threshold" ] && [ "$distinct" -ge 2 ]
+}
+
+# Repetition, not equality. A model stuck in a loop keeps working — new output
+# every sample — while arriving back at screens it has already rendered, so the
+# A,B,A tail test never fires. Count how often this exact screen recurs inside a
+# recent window instead.
+#
+# Two distinct screens are required: a window of one repeated value means nothing
+# is happening at all, which is idle or stalled, and answering that with the loop
+# ladder would mislabel it.
+fleet_watch_screen_loop() {  # <history-file> <digest> <window> <threshold>
+  local hist=$1 digest=$2 window=$3 threshold=$4 recent seen distinct
+  printf '%s\n' "$digest" >> "$hist"
+  # Bounded: the file is a ring, not a record.
+  if [ "$(wc -l < "$hist")" -gt $(( window * 2 )) ]; then
+    tail -n "$window" "$hist" > "$hist.trim" && mv "$hist.trim" "$hist"
+  fi
+  recent="$(tail -n "$window" "$hist")"
+  seen="$(fleet_watch_returns "$hist" "$digest" "$window")"
+  distinct="$(printf '%s\n' "$recent" | sort -u | grep -c .)"
+  [ "$seen" -ge "$threshold" ] && [ "$distinct" -ge 2 ]
+}
+
+# Is a human part-way through typing into this pane? An agent that asked a
+# question and an agent that quit early look identical from the outside — both
+# sit at a prompt reporting "done" — but the pane in front of an operator who is
+# composing a reply is not idle, and a nudge sent into it is appended to their
+# half-written line and submitted with it. That is what happened to m002.
+#
+# The last prompt line is the input line; every earlier one is scrollback. A
+# screen with no prompt marker at all says nothing: unknown TUIs fall through to
+# the detection that was there before rather than being guessed at.
+fleet_watch_human_draft() {  # <tail-text> -> rc 0 when the input line has content
+  local tail=$1 line
+  line="$(printf '%s\n' "$tail" | grep '❯' | tail -n 1)" || return 1
+  [ -n "$line" ] || return 1
+  line="${line##*❯}"                      # keep what follows the marker
+  line="$(printf '%s' "$line" | tr -d '[:space:]')"
+  [ -n "$line" ]
+}
+
+fleet_watch_over_budget() {  # <stage_started_epoch> <now_epoch> <budget_seconds>
+  [ "$(( $2 - $1 ))" -ge "$3" ]
+}

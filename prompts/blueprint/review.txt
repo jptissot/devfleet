@@ -1,0 +1,28 @@
+You are running the review stage for mission {mission_id} in {worktree}.
+Task: {description}
+
+Review the spec this mission produced, under docs/superpowers/specs/. You were
+not present for the interview that produced it, and that is the point: the
+spec's real reader is a cold agent implementing from it with no more context
+than you have.
+
+Judge it on four things, in this order:
+
+1. Placeholders. TBD, TODO, "handle edge cases", "add appropriate validation",
+   an empty section. Each is a decision nobody made.
+2. Internal contradictions. Does a later section assume something an earlier one
+   ruled out? Does the architecture match the feature list?
+3. Ambiguity. Could a requirement be read two ways by someone implementing it
+   alone at speed? If so it will be, and it belongs in the findings.
+4. Scope. Is this one implementable piece of work, or several that should be
+   separate specs?
+
+Do not review the underlying idea, and do not restate the design back. You are
+testing whether the document survives contact with a stranger.
+
+Write findings.json at the worktree root:
+  {"result":"PASS"|"FAIL","findings":[{"severity":"blocking|major|minor","title":"...","detail":"..."}]}
+
+Use the same severity vocabulary the rest of the fleet uses. FAIL on any
+blocking or major finding. Write findings.json ONCE, when you have finished
+deciding: the pipeline reads it the moment you report completion.

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-hooks - carry a bunkered agent's orca hook events to the host receiver.
+#
+# Orca's agent-hook endpoint listens on 127.0.0.1 only, so an agent inside the
+# bunker cannot post to it: another network namespace has no route to the host's
+# loopback, and giving it one would mean binding that endpoint somewhere the
+# sandbox can reach. Nothing about the sandbox needs to change instead — the
+# agent appends its hook payloads to a spool file in the mission worktree, which
+# is already mounted, and this relays them from the host, where the receiver is
+# a local call.
+#
+# Sourced for its functions; runnable as `fleet-hooks relay --mission <id>`.
+
+fleet_hooks_spool() {  # <worktree> -> spool path
+  printf '%s/.devfleet/orca-hooks.jsonl' "$1"
+}
+
+# Port, token, env and version, as orca writes them beside its endpoint.
+fleet_hooks_endpoint() {  # -> "port<TAB>token<TAB>env<TAB>version", or rc 1
+  local f=${ORCA_AGENT_HOOK_ENDPOINT:-${XDG_CONFIG_HOME:-$HOME/.config}/orca/agent-hooks/endpoint.env}
+  [ -r "$f" ] || return 1
+  local port token env version
+  port="$(sed -n 's/^ORCA_AGENT_HOOK_PORT=//p' "$f" | head -1)"
+  token="$(sed -n 's/^ORCA_AGENT_HOOK_TOKEN=//p' "$f" | head -1)"
+  env="$(sed -n 's/^ORCA_AGENT_HOOK_ENV=//p' "$f" | head -1)"
+  version="$(sed -n 's/^ORCA_AGENT_HOOK_VERSION=//p' "$f" | head -1)"
+  { [ -n "$port" ] && [ -n "$token" ]; } || return 1
+  printf '%s\t%s\t%s\t%s' "$port" "$token" "$env" "$version"
+}
+
+# One event, posted exactly as orca's own claude-hook.sh posts it.
+fleet_hooks_post() {  # <port> <token> <env> <version> <paneKey> <tabId> <worktreeId> <payload>
+  printf '%s' "$8" | curl -sS -X POST "http://127.0.0.1:$1/hook/claude" \
+    --connect-timeout 0.5 --max-time 1.5 \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -H "X-Orca-Agent-Hook-Token: $2" \
+    --data-urlencode "paneKey=$5" \
+    --data-urlencode "tabId=$6" \
+    --data-urlencode "worktreeId=$7" \
+    --data-urlencode "env=$3" \
+    --data-urlencode "version=$4" \
+    --data-urlencode "payload@-" >/dev/null 2>&1
+}
+
+# Everything the agent has spooled since the last pass. The cursor lives beside
+# the mission, not in the worktree: the agent can write the spool, and a cursor
+# it could rewind would let it replay its own events.
+fleet_hooks_relay() {  # <mission-id>
+  local id=$1 mj wt spool cursor total endpoint port token env version handle pane tab wtid line n=0
+  mj="$(fleet_mission_json "$id")"; [ -f "$mj" ] || return 0
+  wt="$(fleet_json_get "$mj" '.worktree_path')"
+  spool="$(fleet_hooks_spool "$wt")"
+  [ -s "$spool" ] || return 0
+
+  cursor="$(cat "$(fleet_mission_dir "$id")/hook-cursor" 2>/dev/null || echo 0)"
+  total="$(wc -l < "$spool" | tr -d ' ')"
+  [ "$total" -gt "$cursor" ] || return 0
+
+  endpoint="$(fleet_hooks_endpoint)" || return 0
+  IFS=$'\t' read -r port token env version <<<"$endpoint"
+
+  handle="$(fleet_json_get "$mj" '.terminal')"
+  { [ "$handle" != null ] && [ -n "$handle" ]; } || return 0
+  # The pane key is the terminal's, and only the host can resolve it — which is
+  # why the agent cannot post these itself even with a route.
+  pane="$(fleet_backend_orca terminal show --terminal "$handle" --json 2>/dev/null \
+    | jq -r '.result.terminal | "\(.tabId):\(.leafId)"' 2>/dev/null)"
+  tab="${pane%%:*}"
+  [ -n "$pane" ] && [ "$pane" != "null:null" ] || return 0
+  wtid="$(fleet_json_get "$mj" '.orca_worktree_id')"
+
+  while IFS= read -r line; do
+    n=$((n + 1))
+    [ "$n" -gt "$cursor" ] || continue
+    [ -n "$line" ] || continue
+    fleet_hooks_post "$port" "$token" "$env" "$version" "$pane" "$tab" "$wtid" "$line"
+  done < "$spool"
+  printf '%s\n' "$total" > "$(fleet_mission_dir "$id")/hook-cursor"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -euo pipefail
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=bin/fleet-common
+  . "$SCRIPT_DIR/fleet-common"
+  # shellcheck source=bin/fleet-backend
+  . "$SCRIPT_DIR/fleet-backend"
+  fleet_roots
+  cmd="${1:-}"; shift || true
+  MISSION=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --mission) MISSION=$2; shift 2 ;;
+    *) fleet_die "unknown flag: $1" ;;
+  esac; done
+  case "$cmd" in
+    relay) [ -n "$MISSION" ] || fleet_die "need --mission"; fleet_hooks_relay "$MISSION" ;;
+    *) fleet_die "usage: fleet-hooks relay --mission <id>" ;;
+  esac
+fi

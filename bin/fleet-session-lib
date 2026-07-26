@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-session-lib - session mode detection + briefing text. Sourced only; no
+# `set`, no side effects on source, and NO fleet_roots (it mkdirs state, which
+# must not happen in a worktree). (bin/fleet-common:3 discipline)
+
+# The rendered brief fleet-spawn:86 writes into a mission worktree. Its presence
+# is the one signal that cannot be inherited through the environment.
+fleet_session_brief_file() {
+  local top b
+  top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  for b in "$top"/.devfleet/*.brief; do
+    [ -e "$b" ] || continue
+    printf '%s\n' "$b"
+    return 0
+  done
+  return 1
+}
+
+# True in a linked worktree: git keeps its gitdir under the main repo's
+# .git/worktrees/, so --git-dir and --git-common-dir differ. Not a git repo at
+# all counts as false — a plain directory is not somebody's worktree.
+fleet_session_linked_worktree() {
+  local d c
+  d="$(git rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  c="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  c="$(cd "$c" 2>/dev/null && pwd)" || return 1
+  [ "$d" != "$c" ]
+}
+
+# Does this checkout carry the fleet itself? A devfleet development worktree and
+# a stray mission worktree are both linked worktrees with no brief, so linkedness
+# alone cannot separate them — but only one of them contains the machine and the
+# mission graphs it drives. Both are required: a lone script with the right name
+# is not a fleet.
+#
+# Judged from the working tree in front of us, never from the environment. The
+# script's own location would answer for the *installed* fleet, which is exactly
+# the inheritance an executor session must not be fooled by.
+fleet_session_fleet_checkout() {
+  local top
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ -x "$top/bin/fleet-session-start" ] && [ -d "$top/config/missions" ]
+}
+
+# execute -> a mission worktree with a brief beside us
+# root    -> the fleet root, a devfleet worktree, or any non-worktree checkout
+# orphan  -> a linked worktree that is neither: refuse, exit 3
+fleet_session_mode() {
+  if fleet_session_brief_file >/dev/null; then
+    printf 'execute\n'; return 0
+  fi
+  # A brief outranks everything above it — an executor's worktree may contain a
+  # checkout of anything, including this repo.
+  if fleet_session_linked_worktree && ! fleet_session_fleet_checkout; then
+    printf 'orphan\n'; return 3
+  fi
+  printf 'root\n'; return 0
+}
+
+# <brief-path> -> the executor briefing. The filename carries the identity:
+# .devfleet/<mission>.<stage>.brief (fleet-spawn:86).
+fleet_session_brief_execute() {
+  local path=$1 base mission stage
+  base="$(basename "$path" .brief)"
+  mission="${base%%.*}"; stage="${base#*.}"
+  cat <<BRIEF
+DEVFLEET — you are a mission executor, not the Commander.
+mission $mission, stage $stage
+Your brief is $path. It is the whole job.
+Do not spawn, advance, ship, or answer decisions. AGENTS.md is not addressed to you.
+When finished: fleet-done $mission done|blocked:<question>|failed:<reason>
+BRIEF
+}
+
+# <missions> <decisions> <reconcile-line> -> the fleet-root briefing.
+fleet_session_brief_root() {
+  local missions=$1 decisions=$2 reconciled=$3 state
+  if [ "$missions" -eq 0 ] && [ "$decisions" -eq 0 ]; then
+    state="idle"
+  else
+    state="$missions missions in flight | $decisions open decisions"
+  fi
+  cat <<BRIEF
+DEVFLEET — you are the Commander of this fleet.
+fleet: $state
+$reconciled
+
+MODE: state which mode you are in as your first line, before acting.
+  operate  — fleet work: missions, decisions, reports on fleet repos.
+             Act once, then END YOUR TURN. Never poll. The watcher wakes you.
+  develop  — feature work on devfleet itself, here in this checkout.
+             You do the work directly. Do not spawn a mission against devfleet.
+             The end-your-turn rule does not apply; work the task to completion.
+Infer from the request. Announce the inference. One word from the user corrects it.
+BRIEF
+}

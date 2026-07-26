@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-night - unattended night ops (spec "Night ops"): run queue + concurrency
+# pump + morning debrief. Dual-use: sourceable helpers (fleet_night_*) and a
+# runnable subcommand entrypoint. Sourced section has no side effects.
+
+fleet_night_queue_file() { printf '%s/queue' "$FLEET_STATE"; }
+
+fleet_night_cap() {  # max concurrently-running missions (default 1)
+  local c; c="$(cat "$FLEET_STATE/.night-cap" 2>/dev/null || true)"
+  case "$c" in ''|*[!0-9]*) printf '1' ;; *) printf '%s' "$c" ;; esac
+}
+
+fleet_night_admits() {  # <id> -> 0 admit, 1 reject (reason on stderr)
+  local mj type; mj="$(fleet_mission_json "$1")"
+  [ -f "$mj" ] || { echo "no mission $1" >&2; return 1; }
+  type="$(fleet_json_get "$mj" '.type')"
+  if [ "$(fleet_json_get "$mj" '.driver // "machine"')" = commander ]; then
+    echo "mission $1 is commander-driven — a mission whose driver is asleep cannot run unattended" >&2
+    return 1
+  fi
+  case "$type" in
+    campaign)
+      [ -n "$(fleet_json_get "$mj" '.artifacts.spec // ""')" ] \
+        || { echo "campaign $1 needs a spec (interactive stage) — not admitted" >&2; return 1; } ;;
+    strike)
+      [ -n "$(fleet_json_get "$mj" '.artifacts.issue // ""')" ] \
+        || { echo "strike $1 needs an issue reference — not admitted" >&2; return 1; } ;;
+    recon|fortify)
+      [ -n "$(fleet_json_get "$mj" '.description // ""')" ] \
+        || { echo "$type $1 needs a stated goal — not admitted" >&2; return 1; } ;;
+    *) echo "unknown type $type for $1 — not admitted" >&2; return 1 ;;
+  esac
+  return 0
+}
+
+fleet_night_active_count() {  # missions occupying a run slot
+  local mj n=0 term
+  for mj in "$FLEET_STATE"/missions/*/mission.json; do
+    [ -e "$mj" ] || continue
+    fleet_mission_in_flight "$(fleet_json_get "$mj" '.id')" || continue
+    term="$(fleet_json_get "$mj" '.terminal')"
+    [ "$term" != null ] && [ -n "$term" ] && n=$((n + 1))
+  done
+  printf '%d' "$n"
+}
+
+fleet_night_dequeue() {  # print+remove head id; rc 1 if empty
+  local q; q="$(fleet_night_queue_file)"
+  [ -s "$q" ] || return 1
+  local head; head="$(head -n 1 "$q")"
+  tail -n +2 "$q" > "$q.tmp" && mv "$q.tmp" "$q"
+  [ -n "$head" ] || return 1
+  printf '%s' "$head"
+}
+
+fleet_night_debrief() {  # deterministic scan; one line per outcome bucket
+  local mj id stage ship shipped="" awaiting="" parked="" blocked="" failed="" completed=""
+  for mj in "$FLEET_STATE"/missions/*/mission.json; do
+    [ -e "$mj" ] || continue
+    id="$(fleet_json_get "$mj" '.id')"; stage="$(fleet_json_get "$mj" '.stage')"
+    ship="$(fleet_json_get "$mj" '.ship.mode // ""')"
+    case "$stage" in
+      done)    if [ -n "$ship" ]; then shipped="$shipped $id"; else completed="$completed $id"; fi ;;
+      ready)   awaiting="$awaiting $id" ;;
+      parked)  parked="$parked $id" ;;
+      blocked) blocked="$blocked $id" ;;
+      failed)  failed="$failed $id" ;;
+    esac
+  done
+  printf 'shipped:%s\n'           "${shipped:- none}"
+  printf 'awaiting approval:%s\n' "${awaiting:- none}"
+  printf 'parked:%s\n'            "${parked:- none}"
+  printf 'blocked:%s\n'           "${blocked:- none}"
+  printf 'failed:%s\n'            "${failed:- none}"
+  printf 'completed:%s\n'         "${completed:- none}"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -euo pipefail
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=bin/fleet-common
+  . "$SCRIPT_DIR/fleet-common"
+  # shellcheck source=bin/fleet-pipeline
+  . "$SCRIPT_DIR/fleet-pipeline"
+  fleet_roots
+  cmd="${1:-}"; shift || true
+  case "$cmd" in
+    start)
+      cap=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --cap) cap=$2; shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      : > "$FLEET_STATE/.night"
+      [ -n "$cap" ] && printf '%s' "$cap" > "$FLEET_STATE/.night-cap"
+      : >> "$(fleet_night_queue_file)"
+      fleet_journal night-start "cap=$(fleet_night_cap)"
+      printf 'night ops on (cap=%s)\n' "$(fleet_night_cap)" ;;
+    end)
+      rm -f "$FLEET_STATE/.night"
+      fleet_journal night-end ""
+      printf 'night ops off\n'
+      fleet_night_debrief ;;
+    queue)
+      id=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --mission) id=$2; shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$id" ] || fleet_die "need --mission"
+      fleet_night_admits "$id" || exit 1
+      printf '%s\n' "$id" >> "$(fleet_night_queue_file)"
+      fleet_journal night-queue "$id"
+      printf '%s\n' "$id" ;;
+    pump)
+      cap="$(fleet_night_cap)"
+      while [ "$(fleet_night_active_count)" -lt "$cap" ]; do
+        id="$(fleet_night_dequeue)" || break
+        [ -n "$id" ] || break
+        stage="$(fleet_json_get "$(fleet_mission_json "$id")" '.stage')"
+        if "$SCRIPT_DIR/fleet-spawn" --mission "$id" --stage "$stage" >/dev/null; then
+          fleet_journal night-pump "$id $stage"
+          printf '%s\n' "$id"
+        else
+          fleet_journal night-pump-fail "$id $stage"
+          printf '%s\n' "$id" >> "$(fleet_night_queue_file)"
+          break
+        fi
+      done ;;
+    debrief)
+      if command -v lavish-axi >/dev/null 2>&1; then
+        fleet_night_debrief | lavish-axi format --title "Morning debrief" 2>/dev/null || fleet_night_debrief
+      else
+        fleet_night_debrief
+      fi ;;
+    *) fleet_die "usage: fleet-night {start|end|queue|pump|debrief} ..." ;;
+  esac
+fi

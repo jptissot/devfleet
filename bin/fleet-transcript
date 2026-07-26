@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+fleet_roots
+
+# fleet-transcript - where a mission's agents wrote their sessions.
+#
+# A stage's real record is its transcript, and finding one meant knowing which
+# harness ran the stage and how that harness mangles a worktree path into a
+# directory name. m002 cost an hour to this: `execute` runs omp, the search went
+# to claude's projects directory, found nothing, and the conclusion was that a
+# removed container had destroyed the evidence. It had not — omp keeps sessions
+# somewhere else entirely, in the same airlock home that survives a recreate.
+#
+# So this asks the question the Commander actually has ("where is it?") instead
+# of the one the filesystem answers ("what is under this path?").
+
+usage() { fleet_die "usage: fleet-transcript <mission-id> [--path]"; }
+
+MISSION="" PATH_ONLY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --path) PATH_ONLY=1; shift ;;
+    -*) usage ;;
+    *) [ -z "$MISSION" ] || usage; MISSION=$1; shift ;;
+  esac
+done
+[ -n "$MISSION" ] || usage
+
+mj="$(fleet_mission_json "$MISSION")"
+[ -f "$mj" ] || fleet_die "no mission $MISSION"
+wt="$(fleet_json_get "$mj" '.worktree_path')"
+[ -n "$wt" ] && [ "$wt" != null ] || fleet_die "mission $MISSION has no worktree"
+
+# Both harnesses key sessions on the worktree path with the separators flattened;
+# they disagree only on how the result is fenced. claude: `-a-b-c`. omp wraps the
+# same string in a second pair of dashes: `--a-b-c--`.
+mangled="${wt//\//-}"
+
+# An agent runs either on the host or inside a bunker, and the bunker's home is
+# airlock's per-repo state directory, not $HOME. Search every home that could
+# hold this mission's sessions rather than deciding which one should have.
+homes=()
+if [ -n "${FLEET_AGENT_HOME:-}" ]; then
+  homes+=("$FLEET_AGENT_HOME")
+else
+  homes+=("$HOME")
+  for h in "${XDG_STATE_HOME:-$HOME/.local/state}"/airlock/*/home; do
+    [ -d "$h" ] && homes+=("$h")
+  done
+fi
+
+# "<mtime> <harness> <path>", so the sort below is by time and the newest
+# session — usually the one being asked about — reads last.
+rows=""
+for home in "${homes[@]}"; do
+  for spec in "claude:$home/.claude/projects/$mangled" \
+              "omp:$home/.omp/agent/sessions/-$mangled--"; do
+    harness="${spec%%:*}" dir="${spec#*:}"
+    [ -d "$dir" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      rows+="$(stat -c '%Y' "$f" 2>/dev/null || echo 0) $harness $f"$'\n'
+    done < <(find "$dir" -maxdepth 1 -type f -name '*.jsonl' 2>/dev/null)
+  done
+done
+
+if [ -z "$rows" ]; then
+  [ "$PATH_ONLY" -eq 1 ] && exit 0
+  printf 'no transcript found for %s\n' "$MISSION"
+  printf '  worktree: %s\n' "$wt"
+  exit 0
+fi
+
+sorted="$(printf '%s' "$rows" | sort -n)"
+if [ "$PATH_ONLY" -eq 1 ]; then
+  printf '%s\n' "$sorted" | awk '{ $1=""; $2=""; sub(/^  /, ""); print }'
+else
+  printf '%s\n' "$sorted" | while read -r ts harness f; do
+    printf '%s\t%s\t%s\n' "$(date -d "@$ts" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo "$ts")" \
+      "$harness" "$f"
+  done
+fi

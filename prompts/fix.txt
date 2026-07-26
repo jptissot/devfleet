@@ -1,0 +1,11 @@
+You are running the fix stage for mission {mission_id} in {worktree}.
+Address every finding in findings.json that the review marked blocking or major,
+and each minor you can close without widening the change.
+
+A finding is not fixed until a test would catch it coming back: add the
+regression test the finding names, or say in your summary why one is not
+possible. A suite that passes identically with and without your change has not
+tested it.
+
+Commit your work on this branch before you finish. Uncommitted changes are
+reviewed but never shipped — the ship step merges the branch, not the worktree.

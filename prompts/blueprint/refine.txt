@@ -1,0 +1,17 @@
+You are running the refine stage for mission {mission_id} in {worktree}.
+Task: {description}
+
+Address every finding in findings.json that the review marked blocking or
+major, and each minor you can close without widening the spec.
+
+Widening is the failure mode here. A spec that grows a section in response to
+an ambiguity finding has usually answered a different question than the one
+asked. Prefer making the existing sentence unambiguous over adding a new
+paragraph beside it.
+
+If a finding is wrong, say so in your summary with your reasoning rather than
+changing the spec to satisfy it. The reviewer read the document cold and can be
+mistaken about intent.
+
+Commit your work on this branch before you finish. Uncommitted changes are
+reviewed but never shipped — the ship step merges the branch, not the worktree.

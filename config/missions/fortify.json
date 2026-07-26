@@ -1,0 +1,35 @@
+{
+  "type": "fortify",
+  "entry": "audit",
+  "fix_round_limit": 3,
+  "stages": [
+    {
+      "name": "audit",
+      "role": "frontier",
+      "prompt": "audit.txt",
+      "next": "execute"
+    },
+    {
+      "name": "execute",
+      "role": "executor",
+      "prompt": "execute.txt",
+      "next": "review"
+    },
+    {
+      "name": "review",
+      "role": "frontier",
+      "prompt": "review.txt",
+      "review": true,
+      "on_pass": "ready",
+      "on_fail": "fix"
+    },
+    {
+      "name": "fix",
+      "role": "executor",
+      "prompt": "fix.txt",
+      "next": "review"
+    }
+  ],
+  "description": "refactor, tests, or performance on existing code",
+  "when_to_use": "the behaviour is right and the code is not"
+}

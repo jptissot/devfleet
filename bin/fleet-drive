@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-drive - commander-driven mission lane (spec "Drive mode"). The Commander
+# owns sequencing; the machine owns caps and supervision. Dual-use: sourceable
+# (fleet_drive_*) and runnable (the Commander's API). Sourced section has no
+# side effects on source.
+
+fleet_drive_require() {  # <id> - die unless the mission is commander-driven
+  local mj
+  mj="$(fleet_mission_json "$1")"
+  [ -f "$mj" ] || fleet_die "no mission $1"
+  [ "$(fleet_json_get "$mj" '.driver // "machine"')" = commander ] \
+    || fleet_die "mission $1 is machine-driven"
+}
+
+fleet_drive_in_flight() {  # <id> -> 0 if an agent is running for this mission
+  local mj stage term
+  mj="$(fleet_mission_json "$1")"
+  stage="$(fleet_json_get "$mj" '.stage')"
+  term="$(fleet_json_get "$mj" '.terminal')"
+  case "$stage" in
+    driving|ready|done|parked|blocked|failed) ;;
+    *) return 0 ;;
+  esac
+  [ "$term" != null ] && [ -n "$term" ]
+}
+
+# A cap the Commander cannot argue with: park fail-closed and ask the user.
+fleet_drive_cap_park() {  # <id> <cap-name>
+  local id=$1 cap=$2 mj project did
+  mj="$(fleet_mission_json "$id")"
+  project="$(fleet_json_get "$mj" '.project')"
+  fleet_json_set_str "$mj" '.last_stage' "$(fleet_json_get "$mj" '.stage')"
+  fleet_json_set_str "$mj" '.stage' "parked"
+  fleet_events_append "$id" cap "$cap"
+  fleet_journal drive-cap "$id $cap"
+  did="$(fleet_decision_create "$id" "$project" "cap" \
+    "mission $id hit the $cap cap — extend?" "drive cap reached" \
+    '[{"key":"extend","label":"extend","description":"grant one more cap allowance and hand back to the Commander"},{"key":"hold","label":"hold","description":"leave the mission parked"}]')"
+  [ "$(fleet_mode)" = day ] && "$SCRIPT_DIR/fleet-wake" "decision $did: mission $id hit the $cap cap" 2>/dev/null || true
+  printf '%s' "$did"
+}
+
+fleet_drive_brief_json() {  # <id>
+  local id=$1 mj type unread palette decisions spawns max_spawns max_seconds started now
+  mj="$(fleet_mission_json "$id")"
+  type="$(fleet_json_get "$mj" '.type')"
+  unread="$(fleet_events_unread "$id" | jq -sc '.')"
+  palette="$(fleet_pipeline_palette_names "$type" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  decisions="$(fleet_decision_list --open | awk -F'\t' -v id="$id" '$3 == id { print $1 }' \
+    | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  spawns="$(fleet_json_get "$mj" '.spawn_count')"
+  max_spawns="$(fleet_pipeline_cap "$type" max_spawns)"
+  max_seconds="$(fleet_pipeline_cap "$type" max_mission_seconds)"
+  started="$(fleet_json_get "$mj" '.mission_started_at')"
+  now="$(date +%s)"
+  jq -nc --slurpfile m "$mj" --argjson unread "$unread" --argjson palette "$palette" \
+     --argjson decisions "$decisions" \
+     --argjson spawns_left "$((max_spawns - spawns))" \
+     --argjson seconds_left "$((max_seconds - (now - started)))" \
+    '{mission: $m[0].id, stage: $m[0].stage, description: $m[0].description,
+      worktree: $m[0].worktree_path, palette: $palette, unread: $unread,
+      spawns_left: $spawns_left, seconds_left: $seconds_left, open_decisions: $decisions}'
+}
+
+fleet_drive_brief_text() {  # <id>
+  local j; j="$(fleet_drive_brief_json "$1")"
+  printf '%s' "$j" | jq -r '
+    "mission: \(.mission)  stage: \(.stage)",
+    "task: \(.description)",
+    "worktree: \(.worktree)",
+    "palette: \(.palette | join(" "))",
+    "budget: \(.spawns_left) spawns, \(.seconds_left)s left",
+    "open decisions: \(if (.open_decisions | length) == 0 then "none" else (.open_decisions | join(" ")) end)",
+    "unread events: \(.unread | length)",
+    (.unread[] | "  [\(.kind)] \(.detail)")'
+}
+fleet_drive_check() {  # <id>
+  local id=$1 mj type stage count cursor verb now started max_sec reason key term
+  mj="$(fleet_mission_json "$id")"
+  fleet_mission_in_flight "$id" || return 0
+  type="$(fleet_json_get "$mj" '.type')"
+  stage="$(fleet_json_get "$mj" '.stage')"
+
+  # 1. new marker -> event + hand back
+  count="$(fleet_done_count "$id")"; cursor="$(fleet_json_get "$mj" '.marker_cursor')"
+  if [ "$count" -gt "$cursor" ]; then
+    verb="$(fleet_done_latest "$id" || true)"
+    fleet_json_set "$mj" ".marker_cursor=$count | .terminal=null"
+    fleet_json_set_str "$mj" '.last_stage' "$stage"
+    fleet_json_set_str "$mj" '.stage' "driving"
+    case "$verb" in
+      done|blocked:*|failed:*) fleet_events_append "$id" marker "$verb" ;;
+      *)                       fleet_events_append "$id" marker "unrecognized:$verb" ;;
+    esac
+    fleet_journal drive-marker "$id $stage $verb"
+    "$SCRIPT_DIR/fleet-wake" "mission $id: $stage -> $verb" 2>/dev/null || true
+    return 0
+  fi
+
+  # 2. wall-clock cap: the one place the machine overrides the Commander mid-agent
+  now="$(date +%s)"
+  started="$(fleet_json_get "$mj" '.mission_started_at')"
+  max_sec="$(fleet_pipeline_cap "$type" max_mission_seconds)"
+  if fleet_watch_over_budget "$started" "$now" "$max_sec"; then
+    term="$(fleet_json_get "$mj" '.terminal')"
+    [ "$term" != null ] && [ -n "$term" ] && fleet_backend_terminal_stop "$term"
+    fleet_drive_cap_park "$id" max_mission_seconds >/dev/null
+    return 0
+  fi
+
+  # 3. nothing spawned -> nothing to detect
+  [ "$stage" = driving ] && return 0
+
+  # 4. anomaly -> event + wake, deduped per (stage, reason, spawn_count).
+  # The thresholds come from the watcher that sources this file; the defaults
+  # keep the function usable (and shellcheck-clean) on its own.
+  reason="$(fleet_detect_anomaly "$id" "$now" "${STALL_SECONDS:-900}" "${BUDGET_SECONDS:-2700}")"
+  [ -n "$reason" ] || return 0
+  key="$stage:$reason:$(fleet_json_get "$mj" '.spawn_count')"
+  [ "$key" = "$(fleet_json_get "$mj" '.last_anomaly_key')" ] && return 0
+  fleet_json_set_str "$mj" '.last_anomaly_key' "$key"
+  fleet_events_append "$id" anomaly "$reason"
+  fleet_journal drive-anomaly "$id $stage ($reason)"
+  "$SCRIPT_DIR/fleet-wake" "mission $id: $stage $reason" 2>/dev/null || true
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -euo pipefail
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=bin/fleet-common
+  . "$SCRIPT_DIR/fleet-common"
+  # shellcheck source=bin/fleet-backend
+  . "$SCRIPT_DIR/fleet-backend"
+  # shellcheck source=bin/fleet-pipeline
+  . "$SCRIPT_DIR/fleet-pipeline"
+  # shellcheck source=bin/fleet-detect
+  . "$SCRIPT_DIR/fleet-detect"
+  # shellcheck source=bin/fleet-events
+  . "$SCRIPT_DIR/fleet-events"
+  # shellcheck source=bin/fleet-project
+  . "$SCRIPT_DIR/fleet-project"
+  # shellcheck source=bin/fleet-decision
+  . "$SCRIPT_DIR/fleet-decision"
+  fleet_roots
+
+  cmd="${1:-}"; shift || true
+  case "$cmd" in
+    spawn)
+      MISSION="" STAGE="" ROLE="" PROMPT_TEXT="" LABEL=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --mission) MISSION=$2; shift 2 ;;
+        --stage) STAGE=$2; shift 2 ;;
+        --role) ROLE=$2; shift 2 ;;
+        --prompt-text) PROMPT_TEXT=$2; shift 2 ;;
+        --label) LABEL=$2; shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$MISSION" ] || fleet_die "need --mission"
+      [ -z "$PROMPT_TEXT" ] || [ -z "$STAGE" ] \
+        || fleet_die "--stage cannot be combined with an ad-hoc brief"
+      fleet_drive_require "$MISSION"
+      fleet_drive_in_flight "$MISSION" \
+        && fleet_die "mission $MISSION already has an agent in flight (fleet-drive stop first)"
+
+      mj="$(fleet_mission_json "$MISSION")"
+      type="$(fleet_json_get "$mj" '.type')"
+      count="$(fleet_json_get "$mj" '.spawn_count')"
+      max="$(fleet_pipeline_cap "$type" max_spawns)"
+      if [ "$count" -ge "$max" ]; then
+        fleet_drive_cap_park "$MISSION" max_spawns >/dev/null
+        fleet_die "mission $MISSION reached max_spawns ($max) — parked, answer the decision with 'extend'"
+      fi
+
+      if [ -n "$PROMPT_TEXT" ]; then
+        "$SCRIPT_DIR/fleet-spawn" --mission "$MISSION" --role "$ROLE" \
+          --prompt-text "$PROMPT_TEXT" --label "$LABEL" >/dev/null
+        new_stage="$LABEL"
+      else
+        "$SCRIPT_DIR/fleet-spawn" --mission "$MISSION" --stage "$STAGE" >/dev/null
+        new_stage="$STAGE"
+      fi
+
+      now_epoch="$(date +%s)"
+      fleet_json_set_str "$mj" '.stage' "$new_stage"
+      fleet_json_set "$mj" ".spawn_count=$((count + 1)) | .restarts=0 | .last_anomaly_key=\"\" \
+        | .stage_started_at=$now_epoch | .last_progress_at=$now_epoch | .state_hash=\"\""
+      : > "$(fleet_mission_dir "$MISSION")/hashes"
+      fleet_events_ack "$MISSION"
+      fleet_journal drive-spawn "$MISSION $new_stage (spawn $((count + 1))/$max)"
+      printf '%s\n' "$new_stage" ;;
+    brief)
+      MISSION="" AS_JSON=0
+      while [ $# -gt 0 ]; do case "$1" in
+        --mission) MISSION=$2; shift 2 ;;
+        --json) AS_JSON=1; shift ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$MISSION" ] || fleet_die "need --mission"
+      fleet_drive_require "$MISSION"
+      if [ "$AS_JSON" -eq 1 ]; then fleet_drive_brief_json "$MISSION"; printf '\n'
+      else fleet_drive_brief_text "$MISSION"; fi ;;
+    stop)
+      # Clear the current agent — dead, wrong, or unwanted — and hand the mission
+      # back. An anomaly leaves the agent in place by design; this is how the
+      # Commander acts on one without spending a decision record.
+      MISSION=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --mission) MISSION=$2; shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$MISSION" ] || fleet_die "need --mission"
+      fleet_drive_require "$MISSION"
+      mj="$(fleet_mission_json "$MISSION")"
+      stage="$(fleet_json_get "$mj" '.stage')"
+      term="$(fleet_json_get "$mj" '.terminal')"
+      [ "$term" != null ] && [ -n "$term" ] && fleet_backend_terminal_stop "$term"
+      case "$stage" in
+        driving|ready|done|parked|blocked|failed) ;;
+        *) fleet_json_set_str "$mj" '.last_stage' "$stage"
+           fleet_json_set_str "$mj" '.stage' "driving" ;;
+      esac
+      fleet_json_set "$mj" '.terminal=null | .last_anomaly_key=""'
+      fleet_events_append "$MISSION" note "stopped $stage"
+      fleet_journal drive-stop "$MISSION $stage"
+      printf 'driving\n' ;;
+    ack)
+      MISSION=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --mission) MISSION=$2; shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$MISSION" ] || fleet_die "need --mission"
+      fleet_drive_require "$MISSION"
+      fleet_events_ack "$MISSION" ;;
+    state)
+      MISSION="" NEW="" REASON=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --mission) MISSION=$2; shift 2 ;;
+        --set) NEW=$2; shift 2 ;;
+        --reason) REASON=$2; shift 2 ;;
+        *) fleet_die "unknown flag: $1" ;;
+      esac; done
+      [ -n "$MISSION" ] && [ -n "$NEW" ] || fleet_die "need --mission and --set"
+      fleet_drive_require "$MISSION"
+      case "$NEW" in
+        ready|done|parked|blocked|failed) ;;
+        *) fleet_die "state must be one of: ready done parked blocked failed" ;;
+      esac
+      mj="$(fleet_mission_json "$MISSION")"
+      now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+      fleet_json_set_str "$mj" '.last_stage' "$(fleet_json_get "$mj" '.stage')"
+      fleet_json_set_str "$mj" '.stage' "$NEW"
+      fleet_json_set "$mj" ".updated_at=\"$now\""
+      fleet_events_append "$MISSION" note "state=$NEW${REASON:+ ($REASON)}"
+      fleet_journal drive-state "$MISSION -> $NEW${REASON:+ ($REASON)}"
+      if [ "$NEW" = ready ]; then
+        project="$(fleet_json_get "$mj" '.project')"; repo="$(fleet_json_get "$mj" '.repo')"
+        if [ "$(fleet_repo_field "$project" "$repo" unattended)" = "true" ]; then
+          "$SCRIPT_DIR/fleet-ship" "$MISSION" >/dev/null
+          fleet_journal drive-state "$MISSION unattended -> shipped"
+        else
+          did="$(fleet_decision_create "$MISSION" "$project" "ready" \
+            "mission $MISSION is ready — ship?" "commander declared ready" \
+            '[{"key":"ship","label":"ship","description":"apply the repo ship mode"},{"key":"hold","label":"hold","description":"leave in ready"}]')"
+          [ "$(fleet_mode)" = day ] && "$SCRIPT_DIR/fleet-wake" "decision $did: mission $MISSION ready — ship?" 2>/dev/null || true
+        fi
+      fi
+      printf '%s\n' "$(fleet_json_get "$mj" '.stage')" ;;
+    *) fleet_die "usage: fleet-drive {spawn|stop|brief|ack|state} ..." ;;
+  esac
+fi

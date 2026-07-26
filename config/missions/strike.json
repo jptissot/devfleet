@@ -1,0 +1,35 @@
+{
+  "type": "strike",
+  "entry": "plan",
+  "fix_round_limit": 3,
+  "stages": [
+    {
+      "name": "plan",
+      "role": "frontier",
+      "prompt": "plan.txt",
+      "next": "execute"
+    },
+    {
+      "name": "execute",
+      "role": "executor",
+      "prompt": "execute.txt",
+      "next": "review"
+    },
+    {
+      "name": "review",
+      "role": "frontier",
+      "prompt": "review.txt",
+      "review": true,
+      "on_pass": "ready",
+      "on_fail": "fix"
+    },
+    {
+      "name": "fix",
+      "role": "executor",
+      "prompt": "fix.txt",
+      "next": "review"
+    }
+  ],
+  "description": "fix a known bug from an issue reference",
+  "when_to_use": "the defect is already reported and understood"
+}

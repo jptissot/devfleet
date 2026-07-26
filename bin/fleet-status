@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-decision
+. "$SCRIPT_DIR/fleet-decision"
+# shellcheck source=bin/fleet-events
+. "$SCRIPT_DIR/fleet-events"
+fleet_roots
+
+JSON=0
+[ "${1:-}" = "--json" ] && JSON=1
+
+files=()
+for mj in "$FLEET_STATE"/missions/*/mission.json; do
+  [ -e "$mj" ] || continue
+  files+=("$mj")
+done
+
+if [ "$JSON" -eq 1 ]; then
+  missions="$(jq -s 'map({id,type,project,stage,last_stage,ship})' "${files[@]}" 2>/dev/null || echo '[]')"
+  decisions="$(fleet_decision_list --open | jq -R 'split("\t") | {id:.[0],mission:.[2],question:.[3]}' | jq -s '.')"
+  jq -n --argjson m "${missions:-[]}" --argjson d "$decisions" '{missions:$m,decisions:$d}'
+  exit 0
+fi
+
+for mj in "${files[@]:-}"; do
+  [ -n "$mj" ] || continue
+  id="$(jq -r .id "$mj")"; type="$(jq -r .type "$mj")"
+  project="$(jq -r .project "$mj")"; repo="$(jq -r .repo "$mj")"; stage="$(jq -r .stage "$mj")"
+  suffix=""
+  if [ "$(fleet_json_get "$mj" '.driver // "machine"')" = commander ]; then
+    suffix=" drive $(fleet_events_unread "$id" | wc -l | tr -d ' ') unread"
+  fi
+  printf '%s\t%s\t%s/%s\t%s%s\n' "$id" "$type" "$project" "${repo##*/}" "$stage" "$suffix"
+done | sort
+footer="$(fleet_decision_footer || true)"
+[ -n "$footer" ] && printf '%s' "$footer"
+exit 0

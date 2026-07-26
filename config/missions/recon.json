@@ -1,0 +1,19 @@
+{
+  "type": "recon",
+  "entry": "recon",
+  "fix_round_limit": 0,
+  "stages": [
+    {
+      "name": "recon",
+      "role": "frontier",
+      "prompt": "recon.txt",
+      "next": "report"
+    },
+    {
+      "name": "report",
+      "terminal": true
+    }
+  ],
+  "description": "investigate and report; ships nothing",
+  "when_to_use": "you need an answer, not a change"
+}

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-project
+. "$SCRIPT_DIR/fleet-project"
+# shellcheck source=bin/fleet-forge
+. "$SCRIPT_DIR/fleet-forge"
+fleet_roots
+
+ID="${1:-}"; [ -n "$ID" ] || fleet_die "usage: fleet-ship <mission-id>"
+mj="$(fleet_mission_json "$ID")"; [ -f "$mj" ] || fleet_die "no mission $ID"
+PROJECT="$(fleet_json_get "$mj" '.project')"
+REPO="$(fleet_json_get "$mj" '.repo')"
+WT="$(fleet_json_get "$mj" '.worktree_path')"
+
+MODE="$(fleet_repo_field "$PROJECT" "$REPO" ship_mode)"; [ -n "$MODE" ] || MODE=report-only
+REPO_PATH="$(fleet_repo_field "$PROJECT" "$REPO" path)"
+BASE="$(fleet_repo_field "$PROJECT" "$REPO" default_branch)"; [ -n "$BASE" ] || BASE=main
+FORGE="$(fleet_repo_field "$PROJECT" "$REPO" forge)"
+branch="$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+result=""
+case "$MODE" in
+  local-merge)
+    [ -n "$REPO_PATH" ] && [ -n "$branch" ] || fleet_die "local-merge needs repo path + branch"
+    cur="$(git -C "$REPO_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    [ "$cur" = "$BASE" ] || { fleet_journal ship-fail "$ID repo not on $BASE (on ${cur:-?})"; \
+                              fleet_die "repo $REPO_PATH not on $BASE (on ${cur:-?})"; }
+    git -C "$REPO_PATH" merge --ff-only "$branch" >/dev/null 2>&1 \
+      || { fleet_journal ship-fail "$ID local-merge ff-only failed ($branch -> $BASE)"; \
+           fleet_die "ff-only merge failed: $branch -> $BASE"; }
+    result="merged $branch -> $BASE" ;;
+  direct-PR)
+    if url="$(fleet_forge_pr "$FORGE" "$REPO_PATH" "$branch" "$BASE" "mission $ID")"; then
+      result="PR $url"
+    else
+      result="report-only: forge tool unavailable, integrate $branch -> $BASE manually"
+    fi ;;
+  report-only)
+    result="report-only: integrate $branch -> $BASE manually" ;;
+  *) fleet_die "unknown ship mode '$MODE'" ;;
+esac
+
+tmp="$(mktemp)"
+jq --arg m "$MODE" --arg r "$result" --arg now "$now" \
+  '.stage="done" | .ship={mode:$m,result:$r,at:$now} | .updated_at=$now' "$mj" > "$tmp" && mv "$tmp" "$mj"
+fleet_journal ship "$ID $MODE ($result)"
+printf '%s\n' "$result"

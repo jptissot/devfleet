@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-done - append a completion marker into <worktree>/.devfleet/<id>.status.
+# Dual-use: runnable as an entrypoint by an operator, AND sourceable for
+# fleet_done_latest. When sourced, defines functions only (no side effects).
+
+fleet_done_marker() {  # <id> -> path to that mission's status file
+  local id=$1 wt
+  wt="$(fleet_json_get "$(fleet_mission_json "$id")" '.worktree_path')"
+  printf '%s/.devfleet/%s.status' "$wt" "$id"
+}
+
+fleet_done_write() {  # <id> <status>
+  local id=$1 status=$2 marker
+  marker="$(fleet_done_marker "$id")"
+  mkdir -p "$(dirname "$marker")"
+  printf '%s\t%s\n' "$(date +%s)" "$status" >> "$marker"
+}
+
+fleet_done_latest() {  # <id> -> latest status field (after the tab)
+  local marker
+  marker="$(fleet_done_marker "$1")"
+  [ -f "$marker" ] || return 1
+  tail -n1 "$marker" | cut -f2-
+}
+
+fleet_done_count() {  # <id> -> number of marker lines (0 if none)
+  local marker
+  marker="$(fleet_done_marker "$1")"
+  [ -f "$marker" ] || { printf '0'; return 0; }
+  wc -l < "$marker" | tr -d ' '
+}
+
+# Entrypoint behavior only when executed directly (not sourced).
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -euo pipefail
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=bin/fleet-common
+  . "$SCRIPT_DIR/fleet-common"
+  fleet_roots
+  [ $# -eq 2 ] || fleet_die "usage: fleet-done <mission-id> <status>"
+  fleet_done_write "$1" "$2"
+  fleet_journal "done" "$1 $2"
+fi

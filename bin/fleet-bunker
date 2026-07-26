@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-bunker - the ONE seam for airlock (bunker) ops (spec "Bunkers").
+# v1: executor role only; frontier/Commander run bare. All hard container
+# mechanics (repo mount, worktree resolution, network, SELinux, distrobox shim)
+# live INSIDE airlock; this seam is thin. Sourced only; no side effects on source.
+#
+# airlock is repo-scoped: one long-lived container per repo, entered per
+# worktree. So DevFleet asks about the *repo* (`status`) and launches into the
+# *worktree* (`-C <worktree> --`), and never creates or destroys a container
+# itself — recreating one would kill whatever other missions are running in it.
+
+# true if the role flags bunker, or the repo overrides bunker=true.
+fleet_bunker_enabled() {  # <role> <project> <repo-selector>
+  local role=$1 project=$2 repo=$3 rb pb
+  rb="$(fleet_json_get "$FLEET_CONFIG/roles.json" ".${role}.bunker // false")"
+  [ "$rb" = true ] && { printf 'true'; return 0; }
+  pb="$(fleet_repo_field "$project" "$repo" bunker)"
+  [ "$pb" = true ] && { printf 'true'; return 0; }
+  printf 'false'
+}
+
+# Wrap a launch command to run inside the bunker (the one choke point).
+# No --yes: nothing on airlock's launch path prompts. It refuses with an exit
+# code instead, which is what fleet_bunker_state reads *before* we get here.
+fleet_bunker_wrap() {  # <worktree-path> <command-string> -> wrapped command-string
+  printf 'airlock -C %s -- %s' "$1" "$2"
+}
+
+# Kill whatever is still running in a mission's worktree, from inside the
+# container. Closing an orca pane detaches the pty; it does not reach a process
+# the sandbox owns, so a bunkered agent outlives the terminal that launched it
+# and the next spawn would join it rather than replace it.
+#
+# Targeted by working directory, not by name: one container serves every worktree
+# in the repo, and killing by process name would take other missions with it.
+fleet_bunker_kill_worktree() {  # <repo-path> <worktree-path>
+  local repo=$1 wt=$2
+  command -v airlock >/dev/null 2>&1 || return 1
+  # shellcheck disable=SC2016  # $p and $pid are the container shell's, not ours
+  airlock -C "$repo" -- bash -lc '
+    for p in /proc/[0-9]*; do
+      [ "$(readlink "$p/cwd" 2>/dev/null)" = "'"$wt"'" ] || continue
+      pid="${p##*/}"; [ "$pid" = 1 ] && continue
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    exit 0' </dev/null >/dev/null 2>&1
+}
+
+# airlock's exit-code contract, verbatim — this seam translates, never invents:
+#   0 ready · 10 Containerfile unapproved/drifted · 11 config gate outstanding
+#   20 not scaffolded · 21 image missing · 22 image newer than the container
+#   127 airlock not on PATH (this seam's own addition)
+fleet_bunker_state() {  # <repo-path> -> prints state word, returns airlock's code
+  local repo=$1 out rc=0
+  command -v airlock >/dev/null 2>&1 || { printf 'not-installed'; return 127; }
+  out="$(airlock status -C "$repo" 2>/dev/null)" || rc=$?
+  printf '%s' "$out"
+  return "$rc"
+}
+
+# rc 0 when a bunkered agent can launch here.
+#
+# 22 (rebuild-pending) is deliberately launchable: it means the running container
+# predates the newest image, not that the sandbox is broken. Blocking on it would
+# stall every mission in the repo until someone found a quiet moment to recreate
+# the container — and airlock keeps /opt/airlock and /home/agent across that
+# recreate anyway, so an agent needing a new tool is not stuck waiting for it.
+fleet_bunker_launchable() {  # <repo-path>
+  local rc=0
+  fleet_bunker_state "$1" >/dev/null || rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 22 ]
+}
+
+# What a human (or the Commander) should do about a blocking state. Feeds the
+# decision record, so it names a command rather than describing a condition.
+fleet_bunker_remedy() {  # <airlock-exit-code>
+  case "$1" in
+    10) printf 'review the repo .airlock/Containerfile, then: fleet-loadout build --path <repo>' ;;
+    11) printf 'a config key widens the sandbox: review .airlock/config.toml, then: airlock --new -C <repo>' ;;
+    20) printf 'no loadout yet: fleet-loadout init --path <repo>' ;;
+    21) printf 'image is missing: fleet-loadout build --path <repo>' ;;
+    127) printf 'airlock is not installed: ln -sf <airlock-repo>/airlock ~/.local/bin/airlock' ;;
+    *) printf 'airlock status exited %s' "$1" ;;
+  esac
+}
+
+# The decision option key that matches a blocking state, so the Commander is
+# offered the action rather than a wall.
+fleet_bunker_remedy_key() {  # <airlock-exit-code>
+  case "$1" in
+    20) printf 'init' ;;
+    10|21) printf 'build' ;;
+    11) printf 'review-config' ;;
+    127) printf 'install-airlock' ;;
+    *) printf 'investigate' ;;
+  esac
+}

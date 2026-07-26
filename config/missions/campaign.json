@@ -1,0 +1,41 @@
+{
+  "type": "campaign",
+  "entry": "spec",
+  "fix_round_limit": 3,
+  "stages": [
+    {
+      "name": "spec",
+      "role": "frontier",
+      "prompt": "spec.txt",
+      "next": "plan"
+    },
+    {
+      "name": "plan",
+      "role": "frontier",
+      "prompt": "plan.txt",
+      "next": "execute"
+    },
+    {
+      "name": "execute",
+      "role": "executor",
+      "prompt": "execute.txt",
+      "next": "review"
+    },
+    {
+      "name": "review",
+      "role": "frontier",
+      "prompt": "review.txt",
+      "review": true,
+      "on_pass": "ready",
+      "on_fail": "fix"
+    },
+    {
+      "name": "fix",
+      "role": "executor",
+      "prompt": "fix.txt",
+      "next": "review"
+    }
+  ],
+  "description": "build a feature, spec through ship",
+  "when_to_use": "a change that needs specifying, planning and implementing"
+}

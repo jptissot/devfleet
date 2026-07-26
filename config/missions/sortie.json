@@ -1,0 +1,45 @@
+{
+  "type": "sortie",
+  "driver": "commander",
+  "palette": [
+    {
+      "name": "spec",
+      "role": "frontier",
+      "prompt": "spec.txt"
+    },
+    {
+      "name": "plan",
+      "role": "frontier",
+      "prompt": "plan.txt"
+    },
+    {
+      "name": "execute",
+      "role": "executor",
+      "prompt": "execute.txt"
+    },
+    {
+      "name": "review",
+      "role": "frontier",
+      "prompt": "review.txt"
+    },
+    {
+      "name": "fix",
+      "role": "executor",
+      "prompt": "fix.txt"
+    },
+    {
+      "name": "audit",
+      "role": "frontier",
+      "prompt": "audit.txt"
+    },
+    {
+      "name": "recon",
+      "role": "frontier",
+      "prompt": "recon.txt"
+    }
+  ],
+  "max_spawns": 12,
+  "max_mission_seconds": 14400,
+  "description": "commander-driven; stages in any order",
+  "when_to_use": "the work does not fit a fixed graph"
+}

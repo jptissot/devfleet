@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-project
+. "$SCRIPT_DIR/fleet-project"
+# shellcheck source=bin/fleet-bunker
+. "$SCRIPT_DIR/fleet-bunker"
+fleet_roots
+
+# fleet-loadout - a repo's bunker image lifecycle, through the airlock seam.
+# A loadout IS the repo's committed .airlock/ directory; this only drives it.
+
+cmd="${1:-}"; shift || true
+path="" harness=""
+while [ $# -gt 0 ]; do case "$1" in
+  --path) path=$2; shift 2 ;;
+  --harness) harness=$2; shift 2 ;;
+  *) fleet_die "unknown flag: $1" ;;
+esac; done
+[ -n "$path" ] || fleet_die "need --path <repo-path>"
+
+case "$cmd" in
+  init)
+    # --yes, because this runs unattended: airlock's init asks which harness a
+    # project runs, and an unanswered prompt would hang the spawn that triggered
+    # it. roles.json already names the executor's harness, so it answers.
+    [ -n "$harness" ] || harness="$(fleet_json_get "$FLEET_CONFIG/roles.json" '.executor.harness')"
+    { [ -n "$harness" ] && [ "$harness" != null ]; } \
+      || fleet_die "no harness: set .executor.harness in roles.json or pass --harness"
+    # -C leads. airlock's global -C loop stops at `init`, which keeps its own
+    # argparse; a trailing -C reaches it as an unrecognized argument (exit 2).
+    airlock -C "$path" init --yes --harness "$harness"
+    fleet_journal loadout-init "$path ($harness)"
+    ;;
+  build)
+    # `build`, not `--build`: the flag form builds and then launches the agent.
+    airlock build -C "$path"
+    fleet_journal loadout-build "$path"
+    ;;
+  provision)
+    # Harness extensions (plugins, skills) install into the agent's home, and
+    # airlock mounts the persisted home over whatever the image put there — so
+    # this cannot be a Containerfile step. It runs inside the container instead,
+    # where the write lands in the persisted home and outlives every later image
+    # rebuild and container recreate.
+    ran=0
+    while read -r role; do
+      # NUL-delimited, not line-delimited: a command may be a whole script — a
+      # heredoc, a multi-line jq program — and splitting it on newlines feeds
+      # half a command to the shell. An unterminated heredoc then waits on stdin
+      # for the rest of the mission.
+      while IFS= read -r -d '' line; do
+        [ -n "$line" ] || continue
+        ran=1
+        printf 'provision %s: %s\n' "$role" "$(printf '%s' "$line" | head -1)"
+        # </dev/null: the loop reads its list from stdin, and a provisioning
+        # command that reads stdin itself — any TUI does — swallows the commands
+        # that were still queued behind it.
+        airlock -C "$path" -- bash -lc "$line" </dev/null \
+          || fleet_die "provision failed for $role: $(printf '%s' "$line" | head -1)"
+      done < <(jq -j --arg r "$role" '(.[$r].provision // [])[] | . + "\u0000"' \
+                 "$FLEET_CONFIG/roles.json")
+    done < <(fleet_json_get "$FLEET_CONFIG/roles.json" 'keys[]')
+    if [ "$ran" -eq 0 ]; then
+      printf 'nothing to provision: no role declares provision commands\n'
+      exit 0
+    fi
+    fleet_journal loadout-provision "$path"
+    ;;
+  status)
+    rc=0
+    state="$(fleet_bunker_state "$path")" || rc=$?
+    # 0 and 22 are launchable; anything else gets the remedy printed beside it,
+    # since a bare state word tells an operator nothing about the next command.
+    if [ "$rc" -eq 0 ] || [ "$rc" -eq 22 ]; then
+      printf '%s\n' "$state"
+    else
+      printf '%s — %s\n' "$state" "$(fleet_bunker_remedy "$rc")"
+    fi
+    exit "$rc"
+    ;;
+  *) fleet_die "usage: fleet-loadout {init|build|provision|status} --path <repo-path> [--harness <name>]" ;;
+esac

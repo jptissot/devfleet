@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-decision
+. "$SCRIPT_DIR/fleet-decision"
+fleet_roots
+
+command -v gum >/dev/null 2>&1 || fleet_die "fleet-decide requires gum (install: brew install gum / dnf install gum)"
+
+open="$(fleet_decision_list --open)"
+[ -n "$open" ] || { echo "No open decisions."; exit 0; }
+
+# Build the choice list: "d1 | mission m1 | question"
+choices=()
+ids=()
+while IFS=$'\t' read -r id _ mission question; do
+  choices+=("$id | $mission | $question")
+  ids+=("$id")
+done <<<"$open"
+
+selected="$(printf '%s\n' "${choices[@]}" | gum choose --limit "${#choices[@]}" 2>/dev/null)" || exit 0
+[ -n "$selected" ] || exit 0
+
+did="${selected%%|*}"
+did="$(printf '%s' "$did" | tr -d ' ')"
+
+# Show the record details
+f="$(fleet_decision_file "$did")"
+jq '.' "$f"
+
+# Build answer choices from the record's options, or free text
+options="$(jq -r '.options[]? | "\(.key):\(.label)"' "$f" 2>/dev/null || true)"
+if [ -n "$options" ]; then
+  answer="$(printf '%s\n' "$options" | gum choose 2>/dev/null | cut -d: -f1)" || exit 0
+else
+  answer="$(gum input --placeholder "your answer" 2>/dev/null)" || exit 0
+fi
+
+[ -n "$answer" ] || exit 0
+"$SCRIPT_DIR/fleet-decision" answer "$did" "$answer"

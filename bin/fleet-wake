@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-backend
+. "$SCRIPT_DIR/fleet-backend"
+fleet_roots
+
+[ $# -ge 1 ] || fleet_die "usage: fleet-wake <message>"
+MSG="$*"
+
+handle="${FLEET_COMMANDER_TERMINAL:-}"
+[ -n "$handle" ] || handle="$(cat "$FLEET_STATE/.commander-terminal" 2>/dev/null || true)"
+
+if [ -n "$handle" ]; then
+  fleet_backend_terminal_send "$handle" "$MSG"
+  fleet_journal wake "$handle: $MSG"
+else
+  printf '%s\n' "$MSG" >> "$FLEET_STATE/.wake-pending"
+  fleet_journal wake-pending "$MSG"
+fi
+exit 0

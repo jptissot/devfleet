@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-pipeline
+. "$SCRIPT_DIR/fleet-pipeline"
+fleet_roots
+
+MAX_AGE="${FLEET_BEACON_MAX_AGE:-60}"
+[ "${1:-}" = "--beacon-max-age" ] && MAX_AGE="$2"
+
+in_flight=0
+for mj in "$FLEET_STATE"/missions/*/mission.json; do
+  [ -e "$mj" ] || continue
+  if fleet_mission_in_flight "$(fleet_json_get "$mj" '.id')"; then in_flight=1; break; fi
+done
+[ "$in_flight" -eq 1 ] || exit 0
+
+beacon="$FLEET_STATE/.watch-beacon"
+now="$(date +%s)"
+age=$(( now - $(cat "$beacon" 2>/dev/null || echo 0) ))
+if [ ! -f "$beacon" ] || [ "$age" -ge "$MAX_AGE" ]; then
+  echo "fleet: missions in flight but the watcher beacon is dead/stale (age ${age}s). Restart it with: fleet-session-start" >&2
+  exit 2
+fi
+exit 0

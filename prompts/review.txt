@@ -1,0 +1,14 @@
+You are running the review stage for mission {mission_id} in {worktree}.
+Read `git diff` vs base plus the plan, and verify the claims rather than reading
+them: run the build, the linter and the tests, and exercise the behaviour a
+finding describes.
+
+Write findings.json at the worktree root with
+{"result":"PASS"|"FAIL","findings":[{"severity":"blocking|major|minor","title":...}]}.
+
+Write findings.json ONCE, when you have finished deciding. The pipeline reads it
+the moment you report completion and acts on it immediately; a verdict you revise
+afterwards is a verdict nobody sees.
+
+FAIL if anything blocking or major is open, or if the change is uncommitted:
+what is not committed cannot ship.

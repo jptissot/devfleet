@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-backend - the ONE seam for all Orca calls. A tmux + git-worktree fallback
+# would replace this file wholesale (spec "Thin boundaries"). Every op shells
+# `orca <noun> <verb> --json` and parses with jq. Sourced only; no `set`.
+# (Template: firstmate:bin/backends/orca.sh)
+
+# The orca binary. Overridable via ORCA_BIN for installs that name it otherwise
+# (e.g. `orca-ide`). Resolved at call time so sourcing has no side effects.
+fleet_backend_orca() { "${ORCA_BIN:-orca}" "$@"; }
+
+fleet_backend_status_ready() {
+  local out
+  out="$(fleet_backend_orca status --json 2>/dev/null)" || return 1
+  [ "$(printf '%s' "$out" | jq -r '.result.runtime.reachable')" = "true" ]
+}
+
+fleet_backend_worktree_create() {  # <repo-selector> <name> -> "<wt-id>\t<path>"
+  local repo=$1 name=$2 out id path
+  out="$(fleet_backend_orca worktree create --repo "$repo" --name "$name" --no-parent --setup skip --json)" || return 1
+  id="$(printf '%s' "$out" | jq -r '.result.worktree.id')"
+  path="$(printf '%s' "$out" | jq -r '.result.worktree.path')"
+  [ -n "$id" ] && [ "$id" != null ] || return 1
+  printf '%s\t%s' "$id" "$path"
+}
+
+fleet_backend_worktree_rm() {  # <worktree-id>
+  fleet_backend_orca worktree rm --worktree "id:$1" --force --json >/dev/null
+}
+
+fleet_backend_terminal_create() {  # <worktree-id> <title> <command> -> handle
+  local wt=$1 title=$2 cmd=$3 out h
+  out="$(fleet_backend_orca terminal create --worktree "id:$wt" --title "$title" --command "$cmd" --json)" || return 1
+  h="$(printf '%s' "$out" | jq -r '.result.terminal.handle // .result.handle')"
+  [ -n "$h" ] && [ "$h" != null ] || return 1
+  printf '%s' "$h"
+}
+
+fleet_backend_terminal_send() {  # <handle> <text>
+  fleet_backend_orca terminal send --terminal "$1" --text "$2" --enter --json >/dev/null
+}
+
+fleet_backend_terminal_enter() {  # <handle>  (clear a trust/onboarding gate)
+  fleet_backend_orca terminal send --terminal "$1" --enter --json >/dev/null
+}
+
+fleet_backend_terminal_idle() {  # <handle> <timeout-ms> -> "<satisfied>\t<blockedReason>"
+  local out
+  out="$(fleet_backend_orca terminal wait --terminal "$1" --for tui-idle --timeout-ms "$2" --json)" || return 1
+  printf '%s\t%s' \
+    "$(printf '%s' "$out" | jq -r '.result.wait.satisfied')" \
+    "$(printf '%s' "$out" | jq -r '.result.wait.blockedReason')"
+}
+
+# Live, not merely readable. `terminal read` keeps answering for a terminal whose
+# process has exited — so a stop could never confirm, and every advance parked its
+# own mission. The list holds live terminals only, which is the one answer that
+# cannot be stale.
+fleet_backend_terminal_exists() {  # <handle>
+  local out
+  out="$(fleet_backend_orca terminal show --terminal "$1" --json 2>/dev/null)" || return 1
+  [ "$(printf '%s' "$out" | jq -r '.result.terminal.connected // false' 2>/dev/null)" = true ]
+}
+
+# This session's own terminal handle, or "" when not running in an orca pane.
+# ORCA_PANE_KEY is "<tabId>:<leafId>"; the terminal list carries both. The
+# Commander needs it to be reachable — a wake with no handle to send to is a
+# line appended to a file nobody reads.
+fleet_backend_terminal_self() {  # -> handle or ""
+  local key=${ORCA_PANE_KEY:-} out
+  [ -n "$key" ] || { printf ''; return 0; }
+  out="$(fleet_backend_orca terminal list --json 2>/dev/null)" || { printf ''; return 0; }
+  printf '%s' "$out" | jq -r --arg k "$key" \
+    'first(.result.terminals[]? | select("\(.tabId):\(.leafId)" == $k) | .handle) // ""' 2>/dev/null
+}
+
+# What the agent itself reports, via orca's agent hooks: "working" or "done",
+# with the epoch-ms the state began. Prints "<state>\t<startedAtMs>", or "" when
+# this agent does not report — a bunkered agent cannot reach the hook endpoint on
+# the host, so silence here means "no signal", never "idle".
+#
+# The feed is a file orca maintains beside its endpoint descriptor; reading it
+# costs nothing, unlike `terminal wait`, which blocks for its whole timeout on
+# every busy agent.
+fleet_backend_agent_state() {  # <handle> -> "<state>\t<startedAtMs>" or ""
+  # Test seam: the real feed is a file orca maintains on the host, which a test
+  # cannot produce without reaching outside its temp home.
+  if [ -n "${FLEET_FAKE_AGENT_STATE:-}" ]; then
+    printf '%s\t0' "$FLEET_FAKE_AGENT_STATE"; return 0
+  fi
+  local handle=$1 feed pane
+  feed="${ORCA_AGENT_HOOK_STATUS:-${XDG_CONFIG_HOME:-$HOME/.config}/orca/agent-hooks/last-status.json}"
+  [ -f "$feed" ] || { printf ''; return 0; }
+  pane="$(fleet_backend_orca terminal list --json 2>/dev/null \
+    | jq -r --arg h "$handle" \
+        'first(.result.terminals[]? | select(.handle == $h) | "\(.tabId):\(.leafId)") // ""' 2>/dev/null)"
+  [ -n "$pane" ] || { printf ''; return 0; }
+  jq -r --arg p "$pane" \
+    '(.entries[$p] // empty) | "\(.payload.state // "")\t\(.stateStartedAt // 0)"' "$feed" 2>/dev/null
+}
+
+# A digest of what the agent has on screen. Progress detection needs it: an agent
+# that reads, searches or reasons for a long stretch writes nothing to the
+# worktree, and judging it by the worktree alone parks the stages that think
+# hardest. "" when the terminal cannot be read — the caller already treats a
+# missing terminal separately.
+fleet_backend_terminal_digest() {  # <handle> -> hash of the visible tail
+  local out
+  out="$(fleet_backend_orca terminal read --terminal "$1" --json 2>/dev/null)" || { printf ''; return 0; }
+  printf '%s' "$out" | jq -r '.result.terminal.tail // [] | join("\n")' 2>/dev/null \
+    | sha256sum | cut -d' ' -f1
+}
+
+# The visible tail as text rather than as a hash. Only the draft check wants
+# this, and only on the tick it is about to call a pane idle — reading every
+# tick would double the orca calls in the hot loop for a question asked rarely.
+fleet_backend_terminal_tail() {  # <handle> -> visible tail, "" when unreadable
+  local out
+  out="$(fleet_backend_orca terminal read --terminal "$1" --json 2>/dev/null)" || { printf ''; return 0; }
+  printf '%s' "$out" | jq -r '.result.terminal.tail // [] | join("\n")' 2>/dev/null
+}
+
+fleet_backend_terminal_state() {  # <handle> <timeout-ms> -> "<satisfied>\t<blocked>\t<exit>"
+  local out
+  out="$(fleet_backend_orca terminal wait --terminal "$1" --for tui-idle --timeout-ms "$2" --json)" || return 1
+  printf '%s\t%s\t%s' \
+    "$(printf '%s' "$out" | jq -r '.result.wait.satisfied')" \
+    "$(printf '%s' "$out" | jq -r '.result.wait.blockedReason')" \
+    "$(printf '%s' "$out" | jq -r '.result.wait.exitCode')"
+}
+
+# Stop one agent. `orca terminal stop` is worktree-scoped — handed --terminal it
+# answers ok:false and still exits 0, so it was a no-op that read as success and
+# left the old agent running beside whatever the caller spawned next. `close`
+# takes the handle.
+#
+# rc 0 only when the terminal is really gone: a caller about to spawn a
+# replacement must be able to tell.
+fleet_backend_terminal_stop() {  # <handle> -> rc 0 when gone
+  fleet_backend_orca terminal close --terminal "$1" --json >/dev/null 2>&1 || true
+  # close is asynchronous — the terminal can answer one more read on its way out.
+  # A single immediate check calls that a failed stop and parks a mission whose
+  # agent did exactly what it was told.
+  local _try
+  for _try in $(seq 1 "${FLEET_STOP_TRIES:-10}"); do
+    fleet_backend_terminal_exists "$1" || return 0
+    sleep 0.3
+  done
+  return 1
+}

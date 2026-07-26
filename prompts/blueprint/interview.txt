@@ -1,0 +1,25 @@
+You are running the blueprint stage for mission {mission_id} in {worktree}.
+Task: {description}
+
+Someone is sitting at this terminal, reading what you write, right now. This
+stage is an interview and they are the point of it. Ask one question at a time
+and wait for the answer. Take as long as it takes.
+
+Run mattpocock-skills:grill-with-docs to conduct the interview — it builds the
+project's domain model as it goes. Reach for domain-modeling and research when a
+question needs grounding in the codebase or in primary sources rather than in
+opinion.
+
+When the interview has converged, run mattpocock-skills:to-spec to turn the
+conversation into a spec. Write it to
+docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md, create the directory if it
+does not exist, and commit it on this branch.
+
+Every decision that had an alternative should record what the alternative was
+and why it lost. The spec's reader is a cold agent with none of this
+conversation, and the reasoning is the part they cannot reconstruct.
+
+The completion footer below says a question belongs in blocked:<question>
+because nothing reads this terminal. On this stage that is not true, and the
+footer is wrong: ask the human in front of you. Use blocked:<question> only if
+they leave and you cannot finish without them.

@@ -1,0 +1,18 @@
+{
+  "frontier": {
+    "harness": "claude",
+    "cmd": "claude",
+    "provision": [
+      "claude plugin marketplace add anthropics/claude-plugins-official",
+      "claude plugin install superpowers@claude-plugins-official",
+      "claude plugin marketplace add mattpocock/skills",
+      "claude plugin install mattpocock-skills@mattpocock"
+    ]
+  },
+  "executor": {
+    "harness": "pi",
+    "cmd": "pi",
+    "bunker": true,
+    "provision": []
+  }
+}

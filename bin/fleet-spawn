@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fleet-common
+. "$SCRIPT_DIR/fleet-common"
+# shellcheck source=bin/fleet-backend
+. "$SCRIPT_DIR/fleet-backend"
+# shellcheck source=bin/fleet-pipeline
+. "$SCRIPT_DIR/fleet-pipeline"
+# shellcheck source=bin/fleet-project
+. "$SCRIPT_DIR/fleet-project"
+# shellcheck source=bin/fleet-bunker
+. "$SCRIPT_DIR/fleet-bunker"
+# shellcheck source=bin/fleet-config
+. "$SCRIPT_DIR/fleet-config"
+# shellcheck source=bin/fleet-decision
+. "$SCRIPT_DIR/fleet-decision"
+fleet_roots
+
+MISSION="" STAGE="" DRY=0 ROLE_ARG="" PROMPT_TEXT="" LABEL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mission) MISSION=$2; shift 2 ;;
+    --stage) STAGE=$2; shift 2 ;;
+    --role) ROLE_ARG=$2; shift 2 ;;
+    --prompt-text) PROMPT_TEXT=$2; shift 2 ;;
+    --label) LABEL=$2; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    *) fleet_die "unknown flag: $1" ;;
+  esac
+done
+[ -n "$MISSION" ] || fleet_die "need --mission"
+ADHOC=0
+if [ -n "$ROLE_ARG" ] || [ -n "$PROMPT_TEXT" ] || [ -n "$LABEL" ]; then
+  [ -n "$ROLE_ARG" ] && [ -n "$PROMPT_TEXT" ] && [ -n "$LABEL" ] \
+    || fleet_die "ad-hoc spawn needs all of --role --prompt-text --label"
+  [ -z "$STAGE" ] || fleet_die "--stage cannot be combined with an ad-hoc brief"
+  # A label becomes .stage, so it must not collide with the state vocabulary:
+  # `ready` et al would drop the mission out of fleet_mission_in_flight and end
+  # supervision of a live agent.
+  case "$LABEL" in
+    driving|ready|done|parked|blocked|failed)
+      fleet_die "label '$LABEL' is reserved (mission state vocabulary)" ;;
+  esac
+  ADHOC=1; STAGE="$LABEL"
+fi
+[ -n "$STAGE" ] || fleet_die "need --stage or an ad-hoc brief (--role --prompt-text --label)"
+
+mj="$(fleet_mission_json "$MISSION")"
+[ -f "$mj" ] || fleet_die "no mission $MISSION"
+TYPE="$(fleet_json_get "$mj" '.type')"
+DESC="$(fleet_json_get "$mj" '.description')"
+WT="$(fleet_json_get "$mj" '.worktree_path')"
+WT_ID="$(fleet_json_get "$mj" '.orca_worktree_id')"
+PROJECT="$(fleet_json_get "$mj" '.project')"
+REPO="$(fleet_json_get "$mj" '.repo')"
+
+errs="$(fleet_config_validate_type "$TYPE" || true)"
+[ -z "$errs" ] || fleet_die "mission type $TYPE is invalid: $errs"
+
+DRIVER="$(fleet_pipeline_driver "$TYPE")"
+if [ "$ADHOC" -eq 1 ]; then
+  ROLE="$ROLE_ARG"
+  tmpl="$(mktemp)"; printf '%s\n' "$PROMPT_TEXT" > "$tmpl"
+elif [ "$DRIVER" = commander ]; then
+  fleet_pipeline_has_palette "$TYPE" "$STAGE" || fleet_die "stage $STAGE is not in the $TYPE palette"
+  ROLE="$(fleet_pipeline_palette_field "$TYPE" "$STAGE" role)"
+  [ -n "$ROLE" ] || fleet_die "palette entry $STAGE has no role in $TYPE"
+  PROMPT_FILE="$(fleet_pipeline_palette_field "$TYPE" "$STAGE" prompt)"
+  [ -n "$PROMPT_FILE" ] || fleet_die "palette entry $STAGE has no prompt"
+  tmpl="$FLEET_HOME/prompts/$PROMPT_FILE"
+  [ -f "$tmpl" ] || tmpl="$FLEET_ROOT/prompts/$PROMPT_FILE"
+  [ -f "$tmpl" ] || fleet_die "missing prompt template $PROMPT_FILE"
+else
+  ROLE="$(fleet_pipeline_field "$TYPE" "$STAGE" role)"
+  [ -n "$ROLE" ] || fleet_die "stage $STAGE has no role in $TYPE"
+  PROMPT_FILE="$(fleet_pipeline_field "$TYPE" "$STAGE" prompt)"
+  [ -n "$PROMPT_FILE" ] || fleet_die "stage $STAGE has no prompt"
+  tmpl="$FLEET_HOME/prompts/$PROMPT_FILE"
+  [ -f "$tmpl" ] || tmpl="$FLEET_ROOT/prompts/$PROMPT_FILE"
+  [ -f "$tmpl" ] || fleet_die "missing prompt template $PROMPT_FILE"
+fi
+CMD="$(fleet_json_get "$FLEET_CONFIG/roles.json" ".$ROLE.cmd")"
+[ -n "$CMD" ] && [ "$CMD" != null ] || fleet_die "no cmd for role $ROLE in roles.json"
+
+# Render brief: substitute placeholders, append the completion contract footer.
+brief="$WT/.devfleet/$MISSION.$STAGE.brief"
+mkdir -p "$(dirname "$brief")"
+# Render brief with LITERAL substitution (no sed program injection): jq reads the
+# template as raw text and gsubs each placeholder with an --arg value verbatim.
+jq -rn --rawfile tmpl "$tmpl" \
+  --arg mid "$MISSION" --arg desc "$DESC" --arg wt "$WT" \
+  '$tmpl
+   | gsub("\\{mission_id\\}"; $mid)
+   | gsub("\\{description\\}"; $desc)
+   | gsub("\\{worktree\\}"; $wt)' > "$brief"
+# The completion contract is the marker file, not the command that writes it.
+# A bunkered operator has neither: the bunker mounts the target repo and the
+# mission worktree, never devfleet, and fleet-done resolves the marker path out
+# of state/ that is deliberately kept outside the sandbox. So a bunkered brief
+# asks for the same line fleet_done_write appends, by hand. Same bytes, same
+# reader — the watcher parses the file, not the call.
+BUNKERED="$(fleet_bunker_enabled "$ROLE" "$PROJECT" "$REPO")"
+{
+  if [ "$BUNKERED" = true ]; then
+    printf '\nWhen finished, record the result:\n'
+    # shellcheck disable=SC2016  # $(date) is the literal the agent runs, not ours
+    printf '  printf '"'"'%%s\\t%%s\\n'"'"' "$(date +%%s)" <status> >> %s/.devfleet/%s.status\n' \
+      "$WT" "$MISSION"
+  else
+    printf '\nWhen finished, run: fleet-done %s <status>\n' "$MISSION"
+  fi
+  printf '  status is one of: done | blocked:<question> | failed:<reason>\n'
+  # An agent that needs a human decision reaches for its own prompt, and no one
+  # reads it: nothing in the pipeline watches a pane for questions, and a pane
+  # waiting on an answer is indistinguishable from one whose agent quit. m002
+  # asked in its pane, the watcher called it idle, and the nudge it typed landed
+  # in the middle of the operator's half-written reply. `blocked:` is the channel
+  # that becomes a decision record the Commander answers.
+  printf '\nIf you need a human decision, do not ask in this terminal — no one reads\n'
+  printf 'it. Record blocked:<question> and stop. It becomes a decision the\n'
+  printf 'Commander answers, and the mission resumes from your question.\n'
+} >> "$brief"
+
+LAUNCH="$CMD \"\$(cat \"$brief\")\""
+
+# Bunker (spec "Bunkers"): executor-only, one choke point. Ask airlock about the
+# *repo* (one container serves all its worktrees), then launch into *this
+# mission's worktree*. On the real spawn path a blocking state becomes a decision
+# naming its own remedy, never a silent failure.
+if [ "$BUNKERED" = true ]; then
+  if [ "$DRY" -ne 1 ]; then
+    repo_path="$(fleet_repo_field "$PROJECT" "$REPO" path)"
+    bunker_rc=0
+    if [ -z "$repo_path" ]; then
+      bunker_state="no-repo-path"; bunker_rc=1
+    else
+      bunker_state="$(fleet_bunker_state "$repo_path")" || bunker_rc=$?
+    fi
+    # 22 (rebuild-pending) launches: the container merely predates the newest
+    # image. See fleet_bunker_launchable for why that must not stall a repo.
+    if [ "$bunker_rc" -ne 0 ] && [ "$bunker_rc" -ne 22 ]; then
+      remedy="$(fleet_bunker_remedy "$bunker_rc")"
+      fleet_decision_create "$MISSION" "$PROJECT" "$STAGE" \
+        "repo $REPO bunker is $bunker_state — $remedy" "bunkered spawn blocked" \
+        "$(jq -cn --arg k "$(fleet_bunker_remedy_key "$bunker_rc")" --arg d "$remedy" \
+             '[{key:$k,label:$k,description:$d}]')" >/dev/null
+      fleet_journal bunker-blocked "$MISSION $REPO ($bunker_state)"
+      fleet_die "bunkered spawn blocked: repo $REPO is $bunker_state (decision recorded)"
+    fi
+  fi
+  # A fresh agent home gates on questions no unattended agent can answer — trust
+  # this folder?, accept bypass mode? — and they are per-worktree, so a once-per-
+  # repo provision cannot settle them. The role names the commands; they run in
+  # the bunker just before the agent does. A failure here stops the launch: an
+  # agent sitting on a gate looks alive and does nothing.
+  if [ "$DRY" -ne 1 ]; then
+    # NUL-delimited: a pre_spawn command may be a whole script, and splitting it
+    # on newlines would hand the shell a fragment.
+    while IFS= read -r -d '' pre; do
+      [ -n "$pre" ] || continue
+      pre="${pre//\{worktree\}/$WT}"
+      airlock -C "$WT" -- bash -lc "$pre" </dev/null \
+        || fleet_die "pre_spawn failed for $ROLE: $(printf '%s' "$pre" | head -1)"
+    done < <(jq -j --arg r "$ROLE" '(.[$r].pre_spawn // [])[] | . + "\u0000"' \
+               "$FLEET_CONFIG/roles.json")
+  fi
+  LAUNCH="$(fleet_bunker_wrap "$WT" "$LAUNCH")"
+fi
+
+# Name the pane. An agent's identity in the Orca UI otherwise depends on the
+# agent painting a title itself (omp does) or on orca's agent hooks (claude's
+# route, and unreachable from inside a bunker) — so a bunkered claude kept the
+# shell's prompt title and read as an empty terminal. One OSC sequence, written
+# before the agent starts, makes every pane say which mission and stage it is.
+LAUNCH="printf '\\033]0;fleet-$MISSION-$STAGE\\007'; $LAUNCH"
+
+if [ "$DRY" -eq 1 ]; then
+  printf '%s\n' "$LAUNCH"
+  printf 'brief: %s\n' "$brief"
+  exit 0
+fi
+
+fleet_backend_status_ready || fleet_die "orca runtime not ready"
+handle="$(fleet_backend_terminal_create "$WT_ID" "fleet-$MISSION-$STAGE" "$LAUNCH")" \
+  || fleet_die "terminal create failed"
+# The stage is whichever agent is running, so the one place that starts an agent
+# is the one place that records it. Every caller used to set this for itself and
+# the direct call — the entry point AGENTS.md documents — set nothing, so a stage
+# spawned by hand left .stage on the previous state word. `ready` is not in any
+# palette, so fleet_mission_in_flight went false, the watcher stopped supervising
+# a live agent, and its completion marker was never read (m002's fix round).
+# Setting it here is idempotent for the callers that already do.
+#
+# The clocks belong to the agent, not the stage: a spawn that inherits the
+# previous run's timestamps is judged stalled before it has drawn a frame.
+# fleet-advance sets these too; a hand spawn must not be the exception.
+now_epoch="$(date +%s)"
+fleet_json_set_str "$mj" '.stage' "$STAGE"
+fleet_json_set "$mj" ".terminal=\"$handle\" | .updated_at=\"$(date '+%Y-%m-%dT%H:%M:%S%z')\" \
+  | .stage_started_at=$now_epoch | .last_progress_at=$now_epoch | .state_hash=\"\" | .nudges=0"
+fleet_journal spawn "$MISSION $STAGE $handle"
+printf '%s\n' "$handle"

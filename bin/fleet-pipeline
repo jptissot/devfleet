@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-pipeline - read a mission-type's stage graph (data-driven pipeline).
+# The graph is DATA; this is the only reader. Sourced only; no `set`.
+
+fleet_pipeline_file() {  # <type>
+  local f="$FLEET_CONFIG/missions/$1.json"
+  [ -f "$f" ] || fleet_die "unknown mission type '$1' (no $f)"
+  jq -e . "$f" >/dev/null 2>&1 || fleet_die "mission type '$1' is not valid JSON ($f)"
+  printf '%s' "$f"
+}
+
+fleet_pipeline_entry() {  # <type>
+  jq -r '.entry' "$(fleet_pipeline_file "$1")"
+}
+
+fleet_pipeline_fix_limit() {  # <type>
+  jq -r '.fix_round_limit // 3' "$(fleet_pipeline_file "$1")"
+}
+
+fleet_pipeline_field() {  # <type> <stage> <field>  -> value or "" if unset/null
+  jq -r --arg s "$2" --arg k "$3" \
+    '(.stages[]? | select(.name==$s) | .[$k]) // "" | if type=="boolean" then tostring else . end' \
+    "$(fleet_pipeline_file "$1")"
+}
+
+fleet_pipeline_is_stage() {  # <type> <stage>  -> 0 if stage is a graph stage
+  local hit
+  hit="$(jq -r --arg s "$2" 'any(.stages[]; .name==$s)' "$(fleet_pipeline_file "$1")")"
+  [ "$hit" = "true" ]
+}
+
+fleet_pipeline_driver() {  # <type> -> machine | commander
+  jq -r '.driver // "machine"' "$(fleet_pipeline_file "$1")"
+}
+
+fleet_pipeline_has_palette() {  # <type> <name> -> 0 if the palette has that entry
+  local hit
+  hit="$(jq -r --arg s "$2" 'any(.palette[]?; .name==$s)' "$(fleet_pipeline_file "$1")")"
+  [ "$hit" = "true" ]
+}
+
+fleet_pipeline_palette_field() {  # <type> <name> <role|prompt> -> value or ""
+  jq -r --arg s "$2" --arg k "$3" \
+    '(.palette[]? | select(.name==$s) | .[$k]) // ""' "$(fleet_pipeline_file "$1")"
+}
+
+fleet_pipeline_palette_names() {  # <type> -> one palette entry name per line
+  jq -r '.palette[]?.name' "$(fleet_pipeline_file "$1")"
+}
+
+# Ceilings are the user's, not the Commander's. The clamp is applied where the
+# cap is READ, so hand-editing a mission type cannot route around it.
+fleet_pipeline_ceiling() {  # <max_spawns|max_mission_seconds> -> integer
+  local f="$FLEET_CONFIG/fleet.json" def
+  case "$1" in
+    max_spawns)          def=24 ;;
+    max_mission_seconds) def=28800 ;;
+    *) fleet_die "unknown ceiling '$1'" ;;
+  esac
+  if [ -f "$f" ]; then
+    jq -r --arg k "${1}_ceiling" --argjson d "$def" '(.[$k] // $d)' "$f"
+  else
+    printf '%s' "$def"
+  fi
+}
+
+fleet_pipeline_cap() {  # <type> <max_spawns|max_mission_seconds> -> min(type value, ceiling)
+  local def want ceiling
+  case "$2" in
+    max_spawns)          def=12 ;;
+    max_mission_seconds) def=14400 ;;
+    *) fleet_die "unknown cap '$2'" ;;
+  esac
+  want="$(jq -r --arg k "$2" --argjson d "$def" '(.[$k] // $d)' "$(fleet_pipeline_file "$1")")"
+  ceiling="$(fleet_pipeline_ceiling "$2")"
+  if [ "$want" -gt "$ceiling" ]; then printf '%s' "$ceiling"; else printf '%s' "$want"; fi
+}
+
+# The wall clock an interactive stage is allowed. It is not a per-type field:
+# a human's pace is a property of there being a human, not of the pipeline, so
+# one number covers every interactive stage and the environment can tune it.
+#
+# Clamped exactly like every other budget. A cap that could be raised from the
+# environment would let an interactive stage outrun the mission ceiling, which
+# is the one number the Commander may not touch.
+fleet_pipeline_interactive_budget() {  # <type> -> seconds
+  local want ceiling
+  want="${FLEET_INTERACTIVE_BUDGET_SECONDS:-14400}"
+  ceiling="$(fleet_pipeline_ceiling max_mission_seconds)"
+  if [ "$want" -gt "$ceiling" ]; then printf '%s' "$ceiling"; else printf '%s' "$want"; fi
+}

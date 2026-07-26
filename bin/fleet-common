@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# fleet-common - shared roots, json helpers, journal, ids. Sourced only; no `set`,
+# no side effects on source. (firstmate:bin/fm-marker-lib.sh:38 discipline)
+
+fleet_roots() {
+  local self_dir
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  export FLEET_ROOT="${FLEET_ROOT_OVERRIDE:-$(cd "$self_dir/.." && pwd)}"
+  export FLEET_HOME="${FLEET_HOME:-$FLEET_ROOT}"
+  export FLEET_STATE="${FLEET_STATE_OVERRIDE:-$FLEET_HOME/state}"
+  export FLEET_CONFIG="${FLEET_CONFIG_OVERRIDE:-$FLEET_HOME/config}"
+  export FLEET_PROJECTS="${FLEET_PROJECTS_OVERRIDE:-$FLEET_HOME/projects}"
+  mkdir -p "$FLEET_STATE/missions" "$FLEET_STATE/decisions"
+}
+
+fleet_die() { echo "error: $*" >&2; exit 1; }
+
+fleet_json_get() {  # <file> <jq-filter>
+  jq -r "$2" "$1"
+}
+
+fleet_json_set() {  # <file> <jq-filter>
+  local f=$1 filter=$2 tmp
+  tmp="$(mktemp)"
+  jq "$filter" "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+fleet_json_set_str() {  # <file> <jq-path> <string-value>
+  local f=$1 path=$2 val=$3 tmp
+  tmp="$(mktemp)"
+  jq --arg v "$val" "$path=\$v" "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+fleet_journal() {  # <event> [detail]
+  local ts
+  ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  printf '%s\t%s\t%s\n' "$ts" "$1" "${2:-}" >> "$FLEET_STATE/journal.log" || true
+}
+
+fleet_next_id() {
+  local seq_file="$FLEET_STATE/.mission-seq" n
+  n=$(( $(cat "$seq_file" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$seq_file"
+  printf 'm%03d' "$n"
+}
+
+fleet_mission_dir() {  # <id>
+  printf '%s/missions/%s' "$FLEET_STATE" "$1"
+}
+fleet_mission_json() {  # <id>
+  printf '%s/missions/%s/mission.json' "$FLEET_STATE" "$1"
+}
+
+fleet_mode() {  # night iff the flag file exists, else day
+  [ -f "$FLEET_STATE/.night" ] && printf 'night' || printf 'day'
+}
+
+fleet_next_decision_id() {
+  local seq_file="$FLEET_STATE/.decision-seq" n
+  n=$(( $(cat "$seq_file" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$seq_file"
+  printf 'd%d' "$n"
+}
+
+# In-flight = occupies a stage/agent slot. Machine missions ask the stage graph;
+# commander-driven missions have no graph, so any non-terminal stage counts.
+fleet_mission_in_flight() {  # <id>
+  local mj type stage driver
+  mj="$(fleet_mission_json "$1")"
+  [ -f "$mj" ] || return 1
+  driver="$(fleet_json_get "$mj" '.driver // "machine"')"
+  stage="$(fleet_json_get "$mj" '.stage')"
+  if [ "$driver" = commander ]; then
+    case "$stage" in ready|done|parked|blocked|failed) return 1 ;; *) return 0 ;; esac
+  fi
+  type="$(fleet_json_get "$mj" '.type')"
+  fleet_pipeline_is_stage "$type" "$stage"
+}
